@@ -1,0 +1,259 @@
+"""AIOps 多智能体诊断服务.
+
+把 LangGraph 图的 astream 输出包装成统一格式的 SSE 事件流, 供前端消费.
+
+事件类型 (见 schemas/aiops.py EventType):
+  - start           流程启动
+  - skill_selected  SkillRouter 选定 Skill (新增)
+  - plan            Planner 输出初始计划
+  - step_complete   Executor 完成单步
+  - replan          Replanner 给出新计划
+  - report          最终诊断报告
+  - complete        流程结束
+  - error           异常
+
+设计要点:
+  - 全程结构化事件 (字典), 由 API 层统一 JSON 编码
+  - 异常被 try/except 捕获后转为 error 事件, 不让流中断
+  - 单实例 graph: 在模块加载时构建一次, 避免每次请求重新编译
+"""
+
+import asyncio
+from typing import Any, AsyncIterator, Dict
+
+from loguru import logger
+
+from app.agents import build_aiops_graph
+from app.agents.stream_sink import set_sink
+from app.config import settings
+import app.services.chat_memory as chat_memory
+
+# 模块级单例 (图编译有开销, 不要每次请求都建)
+_graph = None
+_agent_semaphore = asyncio.Semaphore(settings.agent_max_concurrency)
+
+
+def _get_graph():
+    global _graph
+    if _graph is None:
+        _graph = build_aiops_graph()
+    return _graph
+
+
+def _make_event(
+    event_type: str, stage: str, message: str = "", **data: Any
+) -> Dict[str, Any]:
+    """构造统一格式的 SSE 事件."""
+    return {"type": event_type, "stage": stage, "message": message, "data": data}
+
+
+async def stream_diagnose(
+    query: str, *, session_id: str = "default"
+) -> AsyncIterator[Dict[str, Any]]:
+    """流式诊断, yield 一系列结构化事件.
+
+    Args:
+        query:      用户输入 (告警描述 / 故障现象)
+        session_id: 会话 ID, 用于日志关联
+
+    Yields:
+        Dict[str, Any]: SSE 事件字典
+    """
+    if _agent_semaphore.locked():
+        logger.warning(f"[aiops] session={session_id} | 并发已满")
+        yield _make_event(
+            "error",
+            "concurrency_limited",
+            message="当前诊断任务较多，请稍后重试",
+            max_concurrency=settings.agent_max_concurrency,
+        )
+        return
+
+    async with _agent_semaphore:
+        logger.info(f"[aiops] session={session_id} | query={query[:100]}...")
+
+        yield _make_event(
+            "start",
+            "diagnosis_init",
+            message="开始故障诊断",
+            query=query,
+            session_id=session_id,
+        )
+
+        graph = _get_graph()
+
+        # Executor 里 tool_runner 走 astream 的 token 会被 emit_stream 推到这个队列,
+        # 主循环和 graph.astream 节点事件合并 yield, 让前端边跑边看.
+        token_queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue(maxsize=2048)
+        set_sink(token_queue)  # 当前 context 设置, create_task 会复制这份 context
+        done_sentinel: Dict[str, Any] = {"__done__": True}
+
+        async def _graph_runner() -> None:
+            try:
+                async for event in graph.astream(
+                    {"input": query},
+                    config={"recursion_limit": settings.agent_max_steps * 3 + 5},
+                ):
+                    await token_queue.put({"__node__": event})
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await token_queue.put({"__error__": exc})
+            finally:
+                await token_queue.put(done_sentinel)
+
+        runner_task = asyncio.create_task(_graph_runner())
+
+        try:
+            while True:
+                item = await token_queue.get()
+                if item is done_sentinel:
+                    break
+                if "__error__" in item:
+                    exc = item["__error__"]
+                    logger.exception(f"[aiops] session={session_id} | 诊断异常: {exc}")
+                    yield _make_event(
+                        "error", "diagnosis_failed",
+                        message=f"诊断失败: {type(exc).__name__}: {exc}",
+                        error_type=type(exc).__name__,
+                    )
+                    continue
+                if "__node__" in item:
+                    event = item["__node__"]
+                    for node_name, node_output in event.items():
+                        # §6 先发 transition_history, 再发常规节点事件
+                        for tr in (node_output or {}).get("transition_history") or []:
+                            yield _make_event(
+                                "transition",
+                                tr.get("reason", "unknown"),
+                                message=tr.get("detail", ""),
+                                node=tr.get("node", node_name),
+                                ts=tr.get("ts", ""),
+                                reason=tr.get("reason", ""),
+                            )
+                        async for sse_event in _convert_node_event(node_name, node_output):
+                            if sse_event.get("type") == "report":
+                                report_text = (sse_event.get("data") or {}).get("report") or ""
+                                if report_text:
+                                    try:
+                                        await chat_memory.append_diagnosis_report(
+                                            report_text, session_id=session_id
+                                        )
+                                    except Exception as exc:
+                                        logger.warning(
+                                            f"[aiops] 诊断报告缓存失败 session={session_id}: "
+                                            f"{type(exc).__name__}: {exc}"
+                                        )
+                            yield sse_event
+                    continue
+                # 其他都是 Executor 推出来的 token/step_start/tool_call 事件, 直接转 SSE.
+                etype = item.get("type", "token")
+                payload = {k: v for k, v in item.items() if k != "type"}
+                yield _make_event(etype, etype, message="", **payload)
+
+            yield _make_event(
+                "complete", "diagnosis_complete", message="诊断流程完成"
+            )
+
+        except asyncio.CancelledError:
+            # 客户端断开连接, 不算错误, 静默处理
+            logger.info(f"[aiops] session={session_id} | 客户端断开")
+            runner_task.cancel()
+            raise
+        except Exception as e:
+            logger.exception(f"[aiops] session={session_id} | 诊断异常: {e}")
+            yield _make_event(
+                "error",
+                "diagnosis_failed",
+                message=f"诊断失败: {type(e).__name__}: {e}",
+                error_type=type(e).__name__,
+            )
+        finally:
+            if not runner_task.done():
+                runner_task.cancel()
+                try:
+                    await runner_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+
+async def _convert_node_event(
+    node_name: str, node_output: Dict[str, Any]
+) -> AsyncIterator[Dict[str, Any]]:
+    """把 LangGraph 节点输出转成 SSE 事件."""
+    if node_name == "skill_router":
+        skill_name = node_output.get("selected_skill", "")
+        reason = node_output.get("skill_reason", "")
+        response = node_output.get("response", "")
+        yield _make_event(
+            "skill_selected",
+            "skill_selected",
+            message=f"已选定 Skill: {skill_name}",
+            skill=skill_name,
+            reason=reason,
+        )
+        if response:
+            yield _make_event(
+                "report",
+                "report_generated",
+                message="Router 已终止诊断",
+                report=response,
+            )
+
+    elif node_name == "planner":
+        plan = node_output.get("plan", [])
+        yield _make_event(
+            "plan",
+            "plan_created",
+            message=f"诊断计划已生成, 共 {len(plan)} 步",
+            plan=plan,
+        )
+
+    elif node_name == "executor":
+        past = node_output.get("past_steps", [])
+        iteration = node_output.get("iteration", 0)
+        if past:
+            step, result = past[-1]
+            preview = result[:200] + ("..." if len(result) > 200 else "")
+            yield _make_event(
+                "step_complete",
+                "step_executed",
+                message=f"完成第 {iteration} 步",
+                iteration=iteration,
+                step=step,
+                result_preview=preview,
+            )
+
+    elif node_name == "replanner":
+        response = node_output.get("response", "")
+        new_plan = node_output.get("plan", [])
+        if response:
+            # Replanner 决定终止 + 给报告
+            yield _make_event(
+                "report",
+                "report_generated",
+                message="最终诊断报告已生成",
+                report=response,
+            )
+        elif new_plan:
+            # 还要继续
+            yield _make_event(
+                "replan",
+                "plan_updated",
+                message=f"调整计划, 剩余 {len(new_plan)} 步",
+                plan=new_plan,
+            )
+
+    elif node_name == "fork_skill":
+        # §4 cc-haha: fork 子图直接产出最终报告, 一步到位
+        response = node_output.get("response", "")
+        if response:
+            yield _make_event(
+                "report",
+                "report_generated",
+                message="Fork Skill 子图已产出最终报告",
+                report=response,
+                fork=True,
+            )
+
+    # 其他未识别节点忽略 (例如内部节点)
