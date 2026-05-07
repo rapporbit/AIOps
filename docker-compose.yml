@@ -102,6 +102,25 @@ services:
       timeout: 5s
       retries: 5
 
+  open-websearch:
+    container_name: multi-agent-open-websearch
+    build:
+      context: ./open-webSearch-main
+    environment:
+      NODE_ENV: production
+      DEFAULT_SEARCH_ENGINE: ${OPEN_WEBSEARCH_ENGINE:-bing}
+      SEARCH_MODE: ${OPEN_WEBSEARCH_SEARCH_MODE:-auto}
+      ENABLE_CORS: "true"
+      CORS_ORIGIN: "*"
+    command: ["node", "build/index.js", "serve", "--host", "0.0.0.0", "--port", "3210"]
+    ports:
+      - "${OPEN_WEBSEARCH_PORT:-3210}:3210"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3210/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
 networks:
   default:
     name: multi_agent_network

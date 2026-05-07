@@ -45,8 +45,9 @@ from app.agents.executor import execute_node
 from app.agents.fork_runner import fork_skill_node
 from app.agents.planner import plan_node
 from app.agents.replanner import replan_node
+from app.agents.skill_router import skill_router_node
 from app.agents.state import PlanExecuteState
-from app.skills import get_skill_registry, skill_router_node
+from app.skills import get_skill_registry
 
 
 def should_end(state: PlanExecuteState) -> Literal["executor", "planner", "__end__"]:

@@ -13,11 +13,10 @@ from datetime import datetime
 
 from loguru import logger
 
-from app.agents.prompts import REPLANNER_SYSTEM_PROMPT, REPLANNER_USER_TEMPLATE
 from app.agents.state import Act, PlanExecuteState, TriedSkill
-from app.config import settings
 from app.core.llm import get_chat_llm
 from app.core.structured import ainvoke_structured
+from app.runtime.agent_harness import get_agent_harness
 from app.runtime.transitions import (
     REPLANNER_CONTINUE,
     REPLANNER_FINISHED_EMPTY,
@@ -33,15 +32,7 @@ from app.skills import get_skill_registry
 
 
 def _format_past_steps(past_steps: list[tuple[str, str]]) -> str:
-    """把已完成步骤拼成 Markdown 列表. 每条 result 截断防止 prompt 撑爆."""
-    if not past_steps:
-        return "(暂无已完成的步骤)"
-    limit = max(200, settings.agent_replanner_past_step_chars)
-    lines = []
-    for i, (step, result) in enumerate(past_steps, 1):
-        body = result if len(result) <= limit else result[:limit] + f"\n[... 已截断, 原长 {len(result)} 字符]"
-        lines.append(f"## 步骤 {i}: {step}\n{body}")
-    return "\n\n".join(lines)
+    return get_agent_harness().format_past_steps(past_steps)
 
 
 def _last_step_failed(past_steps: list[tuple[str, str]]) -> bool:
@@ -51,33 +42,6 @@ def _last_step_failed(past_steps: list[tuple[str, str]]) -> bool:
     _step, result = past_steps[-1]
     head = (result or "")[:50]
     return head.startswith("[执行失败") or head.startswith("[超过最大步数")
-
-
-_REPORT_SYSTEM_PROMPT = """你是一名资深 SRE 工程师, 基于已收集的证据写一份运维诊断报告.
-
-# 硬性要求
-1. 必须产出完整的 5 段: ① 问题概述 ② 关键证据 ③ 根因分析 ④ 处置建议 ⑤ 结论.
-2. 证据段里要用 Markdown 引用或表格展示关键指标/日志原文片段, 不要凭空编.
-3. 处置建议按 "紧急止损 / 长期优化" 两小节; 紧急止损必须是可立刻执行的命令或操作.
-4. 结论一段话收束, 明确告诉用户根因 + 下一步该做什么.
-5. 中文输出, 语气专业但不啰嗦, 每段不超过 6 行.
-6. 不要写 "我将" "我需要" 这类过程性语言, 直接给结论.
-"""
-
-_REPORT_USER_TEMPLATE = """# 用户原始问题
-{user_input}
-
-# 诊断流程中收集的证据 (按时间顺序)
-{past_steps_text}
-
-# Replanner 初版结论 (flash 写的草稿, 可以参考但不要照抄)
-{draft}
-
-# 报告生成时间
-{current_time}
-
-请严格按 5 段结构, 用 Markdown 输出最终报告.
-"""
 
 
 async def _synthesize_final_report(
@@ -92,8 +56,9 @@ async def _synthesize_final_report(
     Replanner 自己用 flash 做决策, 这里用 pro 专职 polish, 质量/速度两头兼顾.
     失败时返回 draft (或 _force_summary 做进一步兜底).
     """
-    report_model = settings.agent_report_model or settings.dashscope_chat_model
-    decide_model = settings.agent_planner_model or settings.dashscope_router_model
+    harness = get_agent_harness()
+    report_model = harness.report_model()
+    decide_model = harness.report_decision_model()
     # 如果 report_model 和 decide 用的是同一个模型, 说明用户没分层, 直接用 draft 省一次调用.
     if not draft.strip() and not past_steps:
         return ""
@@ -109,19 +74,14 @@ async def _synthesize_final_report(
             timeout=45,
             max_retries=1,
         )
-        past_text = _format_past_steps(past_steps)
-        resp = await llm.ainvoke([
-            {"role": "system", "content": _REPORT_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": _REPORT_USER_TEMPLATE.format(
-                    user_input=user_input,
-                    past_steps_text=past_text,
-                    draft=draft or "(Replanner 未提供草稿)",
-                    current_time=current_time,
-                ),
-            },
-        ])
+        resp = await llm.ainvoke(
+            harness.build_report_messages(
+                user_input=user_input,
+                past_steps=past_steps,
+                current_time=current_time,
+                draft=draft,
+            )
+        )
         content = getattr(resp, "content", str(resp))
         if isinstance(content, list):
             content = "".join(
@@ -218,15 +178,16 @@ def _validate_reroute(
         return False, "LLM 未提议 reroute"
 
     past_steps = state.get("past_steps", [])
-    if len(past_steps) < settings.agent_reroute_min_past_steps:
+    harness = get_agent_harness()
+    if len(past_steps) < harness.min_reroute_past_steps():
         return False, (
-            f"past_steps={len(past_steps)} < 门槛 {settings.agent_reroute_min_past_steps}, 证据不足"
+            f"past_steps={len(past_steps)} < 门槛 {harness.min_reroute_past_steps()}, 证据不足"
         )
 
     reroute_count = state.get("reroute_count", 0)
-    if reroute_count >= settings.agent_max_reroutes:
+    if reroute_count >= harness.max_reroutes():
         return False, (
-            f"reroute_count={reroute_count} 已达上限 {settings.agent_max_reroutes}"
+            f"reroute_count={reroute_count} 已达上限 {harness.max_reroutes()}"
         )
 
     selected_skill = state.get("selected_skill", "")
@@ -260,42 +221,32 @@ async def replan_node(state: PlanExecuteState) -> PlanExecuteState:
         f"reroute_count={reroute_count}"
     )
 
-    # ===== 快路径: plan 还有 ≥N 步未执行 + 上一步未失败 → 跳过 LLM =====
-    # Replanner 调一次 LLM 通常 1-3s, 中间步多调几次会显著拉慢. 计划本来就有冗余余地,
-    # 没必要每步都 re-evaluate; 真正需要 replan 的场景是步骤失败 / 计划快走完.
-    fast_path_threshold = settings.agent_replanner_fast_path_threshold
-    plan_remaining = max(0, len(plan) - 1)  # plan[0] 是刚执行完的, plan[1:] 才是真正剩余
-    if (
-        fast_path_threshold > 0
-        and plan_remaining >= fast_path_threshold
-        and not _last_step_failed(past_steps)
-        and iteration < settings.agent_max_steps - 1  # 给 LLM replan 至少留一步空间
-    ):
-        next_plan = list(plan[1:])
+    harness_decision = get_agent_harness().evaluate_replanner_pre_llm(state)
+    if harness_decision.action == "continue_fast_path":
+        next_plan = list(harness_decision.data.get("next_plan") or [])
         logger.info(
-            f"[Replanner] 快路径: plan 还剩 {plan_remaining} 步, 上一步未失败, 跳过 LLM"
+            f"[Replanner] Harness 快路径: {harness_decision.reason}, 剩余 {len(next_plan)} 步"
         )
         return {
             "plan": next_plan,
             "transition_history": [
                 make_transition(
                     "replanner", REPLANNER_CONTINUE,
-                    f"fast_path: 剩余 {len(next_plan)} 步",
+                    f"harness:{harness_decision.reason}: 剩余 {len(next_plan)} 步",
                 ),
             ],
         }
-
-    # ===== 硬性兜底: 已达最大步数, 强制生成报告 =====
-    if iteration >= settings.agent_max_steps:
-        logger.warning(
-            f"[Replanner] 已达最大步数 {settings.agent_max_steps}, 强制生成报告"
+    if harness_decision.action == "force_report":
+        reason = harness_decision.reason
+        transition_reason = (
+            REPLANNER_MAX_STEPS_FORCE if reason == "max_steps_reached" else "harness_force_report"
         )
-        logger.warning(f"[transition] node=replanner reason={REPLANNER_MAX_STEPS_FORCE} iteration={iteration}")
+        logger.warning(f"[Replanner] Harness 强制收敛: {reason}")
         return {
             "response": _force_summary(user_input, past_steps, current_time),
             "plan": [],
             "transition_history": [
-                make_transition("replanner", REPLANNER_MAX_STEPS_FORCE, f"iteration={iteration}"),
+                make_transition("replanner", transition_reason, str(harness_decision.data)),
             ],
         }
 
@@ -304,48 +255,29 @@ async def replan_node(state: PlanExecuteState) -> PlanExecuteState:
         selected_skill, tried_skills
     )
 
-    # 名额提示 (让 LLM 明确知道还能不能切)
-    quota_remaining = max(0, settings.agent_max_reroutes - reroute_count)
-    min_steps = settings.agent_reroute_min_past_steps
-    if quota_remaining == 0:
-        reroute_quota_hint = "⚠ reroute 名额已用完, 不允许再切 Skill, 请走情况 1 或 2."
-    elif len(past_steps) < min_steps:
-        reroute_quota_hint = (
-            f"⚠ 证据不足 (past_steps={len(past_steps)} < {min_steps}), "
-            f"还不允许 reroute, 请走情况 1 或 2."
-        )
-    else:
-        reroute_quota_hint = (
-            f"可以 reroute (剩余 {quota_remaining} 次), "
-            "但仅限当前 Skill 方向明确不成立时."
-        )
+    harness = get_agent_harness()
+    reroute_quota_hint = harness.build_reroute_quota_hint(
+        reroute_count=reroute_count,
+        past_steps_count=len(past_steps),
+    )
 
-    # ===== 调用 LLM 决策 =====
-    # Replanner 用轻量模型: 决策本身只需要看进度+输出结构化 Plan/Response, 不需要大模型.
-    replanner_model = settings.agent_planner_model or settings.dashscope_router_model
+    replanner_model = harness.replanner_model()
     llm = get_chat_llm(model=replanner_model, temperature=0, timeout=30, max_retries=1)
 
     plan_text = "\n".join(f"  {i+1}. {s}" for i, s in enumerate(plan)) if plan else "(无)"
     past_text = _format_past_steps(past_steps)
 
-    messages = [
-        {"role": "system", "content": REPLANNER_SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": REPLANNER_USER_TEMPLATE.format(
-                input=user_input,
-                current_time=current_time,
-                current_skill_line=current_skill_line,
-                candidate_skills_text=candidate_skills_text,
-                tried_skills_text=tried_skills_text,
-                reroute_count=reroute_count,
-                max_reroutes=settings.agent_max_reroutes,
-                reroute_quota_hint=reroute_quota_hint,
-                plan_text=plan_text,
-                past_steps_text=past_text,
-            ),
-        },
-    ]
+    messages = harness.build_replanner_messages(
+        user_input=user_input,
+        current_time=current_time,
+        current_skill_line=current_skill_line,
+        candidate_skills_text=candidate_skills_text,
+        tried_skills_text=tried_skills_text,
+        reroute_count=reroute_count,
+        reroute_quota_hint=reroute_quota_hint,
+        plan_text=plan_text,
+        past_steps_text=past_text,
+    )
 
     try:
         act = await ainvoke_structured(

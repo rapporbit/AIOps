@@ -4,7 +4,7 @@
   - app.services.rag.retrieval     知识库检索 + context 拼接
   - app.services.rag.web_context   联网搜索 + 安全过滤
   - app.services.rag.memory        query 改写 + 历史压缩
-  - app.services.rag.prompts       Prompt 模板
+  - app.runtime.agent_harness      Prompt / 轮次 / 降级策略
   - app.services.rag.utils         消息格式化辅助
 """
 
@@ -19,15 +19,12 @@ from loguru import logger
 
 from app.agents.stream_sink import set_sink
 from app.config import settings
+from app.core.web_search import get_provider as get_web_search_provider
 from app.core.llm import get_chat_llm
+from app.runtime.agent_harness import HarnessUsageStats, get_agent_harness
 from app.runtime.tool_runner import run_parallel_agent
 import app.services.chat_memory as chat_memory
 from app.services.rag.memory import compact_if_needed, rewrite_question
-from app.services.rag.prompts import (
-    SYSTEM_PROMPT,
-    SYSTEM_PROMPT_WITH_TOOLS,
-    USER_PROMPT_TEMPLATE,
-)
 from app.services.rag.retrieval import build_context
 from app.services.rag.utils import content_to_text, history_to_messages
 from app.services.rag.web_context import build_web_context
@@ -159,7 +156,7 @@ async def stream_chat(
         mark_start=True, data={"top_k": top_k, "mode": mode_text},
     )
     if web_search:
-        yield progress("web", "正在联网补充资料", "", data={"provider": settings.web_search_provider})
+        yield progress("web", "正在联网补充资料", "", data={"provider": get_web_search_provider()})
 
     retrieve_task = asyncio.create_task(build_context(rewritten_question, top_k))
     web_task = asyncio.create_task(
@@ -170,7 +167,19 @@ async def stream_chat(
             enabled=web_search,
         )
     )
-    context, hits, sources, hits_meta = await retrieve_task
+    try:
+        context, hits, sources, hits_meta = await retrieve_task
+    except Exception as exc:
+        logger.exception(f"[rag] 知识库检索失败, 启用降级: {exc}")
+        fallback = get_agent_harness().rag_fallback(stage="retrieve", exc=exc)
+        context = fallback["context"]
+        hits = 0
+        sources = fallback["sources"]
+        hits_meta = fallback["hits_meta"]
+        yield progress(
+            "retrieve_degraded", "知识库检索降级", fallback["event_data"]["error_type"],
+            mark_start=True, data=fallback["event_data"],
+        )
     if hits:
         src_preview = ", ".join(dict.fromkeys(sources[:3])) if sources else ""
         yield progress(
@@ -183,7 +192,20 @@ async def stream_chat(
             mark_start=True, data={"hits": [], "top_k": top_k, "mode": mode_text},
         )
 
-    web_context, web_sources, web_hits, web_skip_reason = await web_task
+    try:
+        web_context, web_sources, web_hits, web_skip_reason = await web_task
+    except Exception as exc:
+        logger.exception(f"[rag] 联网补充失败, 启用降级: {exc}")
+        fallback = get_agent_harness().web_fallback(stage="web", exc=exc)
+        web_context = fallback["context"]
+        web_sources = fallback["sources"]
+        web_hits = fallback["hits"]
+        web_skip_reason = fallback["skip_reason"]
+        if web_search:
+            yield progress(
+                "web_degraded", "联网补充降级", fallback["event_data"]["error_type"],
+                mark_start=True, data=fallback["event_data"],
+            )
     if web_search:
         if web_hits:
             yield progress(
@@ -193,7 +215,7 @@ async def stream_chat(
                 data={
                     "results": web_hits,
                     "topics": [s.replace("web:", "") for s in web_sources],
-                    "provider": settings.web_search_provider,
+                    "provider": get_web_search_provider(),
                 },
             )
         else:
@@ -224,7 +246,8 @@ async def stream_chat(
     else:
         diagnosis_context = "(暂无最近诊断报告)"
 
-    user_prompt = USER_PROMPT_TEMPLATE.format(
+    harness = get_agent_harness()
+    user_prompt = harness.build_rag_user_prompt(
         summary=summary,
         diagnosis_context=diagnosis_context,
         context=context,
@@ -241,18 +264,19 @@ async def stream_chat(
         "",
         mark_start=True,
         data={
-            "model": settings.dashscope_chat_model,
+            "model": harness.rag_chat_model(),
             "tools_enabled": tools_enabled,
             "tools": [t.name for t in rag_tools] if tools_enabled else [],
         },
     )
     llm_kwargs: dict[str, Any] = {"temperature": 0.3, "streaming": True}
-    if _supports_thinking(settings.dashscope_chat_model):
+    if _supports_thinking(harness.rag_chat_model()):
         llm_kwargs["extra_body"] = {"enable_thinking": True}
-    llm = get_chat_llm(**llm_kwargs)
+    llm = get_chat_llm(model=harness.rag_chat_model(), **llm_kwargs)
 
     full_answer = ""
     input_tokens = output_tokens = total_tokens = 0
+    tool_calls_count = tool_ms = 0
     llm_t0 = time.perf_counter()
 
     if tools_enabled:
@@ -273,13 +297,14 @@ async def stream_chat(
 
         async def _runner() -> dict:
             try:
+                policy = harness.rag_tool_policy()
                 return await run_parallel_agent(
                     llm=llm,
                     tools=rag_tools,
-                    system_prompt=SYSTEM_PROMPT_WITH_TOOLS,
+                    system_prompt=harness.rag_system_prompt(tools_enabled=True),
                     inputs={"messages": history_msgs},
-                    max_iters=settings.rag_chat_max_tool_rounds,
-                    max_parallel=4,
+                    max_iters=policy.max_iters,
+                    max_parallel=policy.max_parallel,
                 )
             finally:
                 # 不论成功失败, 通知主循环退出消费
@@ -289,8 +314,6 @@ async def stream_chat(
                     pass
 
         runner_task = asyncio.create_task(_runner())
-        tool_calls_count = 0
-
         try:
             while True:
                 ev = await sink_q.get()
@@ -306,6 +329,7 @@ async def stream_chat(
                     tool_calls_count += 1
                     name = ev.get("name") or "?"
                     elapsed_ms = int(ev.get("elapsed_ms") or 0)
+                    tool_ms += elapsed_ms
                     status = ev.get("status") or "?"
                     yield {
                         "type": "progress",
@@ -362,7 +386,7 @@ async def stream_chat(
     else:
         # ===== 退化路径: 没有 MCP 工具时仍按原来方式纯流式 =====
         messages = [
-            SystemMessage(content=SYSTEM_PROMPT),
+            SystemMessage(content=harness.rag_system_prompt(tools_enabled=False)),
             *history_to_messages(recent_messages),
             HumanMessage(content=user_prompt),
         ]
@@ -403,23 +427,21 @@ async def stream_chat(
 
     llm_ms = int((time.perf_counter() - llm_t0) * 1000)
     total_ms = int((time.perf_counter() - total_t0) * 1000)
-    yield {
-        "type": "progress",
-        "stage": "stats",
-        "label": "本轮统计",
-        "detail": (
-            f"输入 {input_tokens} · 输出 {output_tokens} · "
-            f"合计 {total_tokens} tokens · 生成 {llm_ms}ms · 总耗时 {total_ms}ms"
-        ),
-        "elapsed_ms": llm_ms,
-        "data": {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "total_tokens": total_tokens,
-            "llm_ms": llm_ms,
-            "total_ms": total_ms,
-            "model": settings.dashscope_chat_model,
-            "answer_chars": len(full_answer),
-            "tools_enabled": tools_enabled,
-        },
-    }
+    usage_stats = HarnessUsageStats(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+        llm_ms=llm_ms,
+        total_ms=total_ms,
+        tool_calls=tool_calls_count,
+        tool_ms=tool_ms,
+        answer_chars=len(full_answer),
+        model=harness.rag_chat_model(),
+        run_kind="rag_chat",
+    )
+    budget_event = harness.build_budget_event(harness.evaluate_budget(usage_stats))
+    if budget_event:
+        yield budget_event
+    stats_event = harness.build_usage_stats_event(usage_stats)
+    stats_event["data"]["tools_enabled"] = tools_enabled
+    yield stats_event

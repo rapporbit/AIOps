@@ -9,8 +9,8 @@ from loguru import logger
 
 from app.config import settings
 from app.core.llm import get_chat_llm
+from app.runtime.agent_harness import get_agent_harness
 import app.services.chat_memory as chat_memory
-from app.services.rag.prompts import COMPACT_PROMPT_TEMPLATE, REWRITE_PROMPT_TEMPLATE
 from app.services.rag.utils import content_to_text, format_history
 
 
@@ -26,13 +26,14 @@ async def rewrite_question(
     if not summary and not recent_messages:
         return question
     try:
-        prompt = REWRITE_PROMPT_TEMPLATE.format(
+        harness = get_agent_harness()
+        prompt = harness.build_rag_rewrite_prompt(
             summary=summary or "(无)",
             history=format_history(recent_messages),
             question=question,
         )
         llm = get_chat_llm(
-            model=settings.dashscope_router_model,
+            model=harness.rag_rewrite_model(),
             temperature=0,
             streaming=False,
             timeout=20,
@@ -62,12 +63,19 @@ async def compact_if_needed(session_id: str) -> None:
         return
     old_summary = await chat_memory.get_summary(session_id)
     try:
-        prompt = COMPACT_PROMPT_TEMPLATE.format(
+        harness = get_agent_harness()
+        prompt = harness.build_rag_compact_prompt(
             max_chars=settings.rag_chat_summary_max_chars,
             old_summary=old_summary or "(无)",
             old_messages=format_history(old_messages),
         )
-        llm = get_chat_llm(temperature=0, streaming=False, timeout=40, max_retries=1)
+        llm = get_chat_llm(
+            model=harness.rag_compact_model(),
+            temperature=0,
+            streaming=False,
+            timeout=40,
+            max_retries=1,
+        )
         resp = await llm.ainvoke([HumanMessage(content=prompt)])
         summary = content_to_text(resp.content).strip()
         if summary:

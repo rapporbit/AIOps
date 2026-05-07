@@ -21,7 +21,7 @@ from __future__ import annotations
 from loguru import logger
 
 from app.agents.state import PlanExecuteState
-from app.config import settings
+from app.runtime.agent_harness import get_agent_harness
 from app.runtime.transitions import (
     FORK_FAILED,
     FORK_SUCCESS,
@@ -74,7 +74,7 @@ async def fork_skill_node(state: PlanExecuteState) -> PlanExecuteState:
         # 关键: 标记子图, 防止 route_after_skill 再走 fork → 无限递归
         "inside_fork": True,
         # 透传父级 permission_mode (子图也走相同安全策略)
-        "permission_mode": state.get("permission_mode", "") or settings.permission_mode,
+        "permission_mode": state.get("permission_mode", "") or get_agent_harness().default_permission_mode(),
     }
 
     try:

@@ -264,16 +264,31 @@ class Settings(BaseSettings):
             "防止全量历史 (尤其工具返回 10KB+) 把 LLM 上下文撑爆, 也提速."
         ),
     )
+    harness_max_total_tokens: int = Field(default=0, description="单次 Harness run 的总 token 硬上限, 0 表示不限制")
+    harness_max_total_ms: int = Field(default=0, description="单次 Harness run 的总耗时硬上限, 0 表示不限制")
+    harness_budget_warn_ratio: float = Field(default=0.8, description="达到预算比例后输出 warning 事件")
 
     # ==================== 联网搜索 ====================
-    # provider 可选: mock (默认, 零依赖) / tavily (生产推荐, 需 API Key) / ddgs (国内不稳)
+    # provider 可选: open_websearch (本地 daemon, 无 API Key) / mock / ddgs (国内不稳)
     web_search_provider: str = Field(
-        default="mock",
-        description="联网搜索 provider: mock / tavily / ddgs",
+        default="open_websearch",
+        description="联网搜索 provider: open_websearch / mock / ddgs",
     )
-    tavily_api_key: str = Field(
-        default="",
-        description="Tavily Search API Key (provider=tavily 时必填)",
+    open_websearch_base_url: str = Field(
+        default="http://127.0.0.1:3210",
+        description="open-webSearch 本地 daemon 地址",
+    )
+    open_websearch_engine: str = Field(
+        default="bing",
+        description="open-webSearch 默认搜索引擎, 如 bing / baidu / duckduckgo / startpage",
+    )
+    open_websearch_search_mode: str = Field(
+        default="auto",
+        description="open-webSearch 搜索模式: request / auto / playwright",
+    )
+    open_websearch_timeout_sec: float = Field(
+        default=15.0,
+        description="open-webSearch HTTP 调用超时秒数",
     )
 
     # ==================== Docker 管理 ====================

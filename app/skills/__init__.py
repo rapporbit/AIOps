@@ -8,22 +8,18 @@
 关键概念:
   - Skill        : 面向某类故障的剧本 (例如 host_resource_diagnosis / network_diagnosis)
   - SkillRegistry: 启动时加载 app/skills/definitions/ 下所有 SKILL.md, 单例
-  - skill_router : LangGraph 节点, 跑在 planner 之前, 选一个 skill 写入 state
 
 模块对外接口:
   - get_skill_registry()  : 全局单例
-  - skill_router_node()   : LangGraph 节点
   - Skill, SkillRegistry  : 类型
 """
 
 from app.skills.models import Skill
 from app.skills.registry import GENERIC_SKILL_NAME, SkillRegistry, get_skill_registry
-from app.skills.router import skill_router_node
 
 __all__ = [
     "Skill",
     "SkillRegistry",
     "GENERIC_SKILL_NAME",
     "get_skill_registry",
-    "skill_router_node",
 ]

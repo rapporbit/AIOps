@@ -20,6 +20,7 @@ param(
     [switch]$NoMcp,
     [switch]$NoMilvus,
     [switch]$NoRedis,
+    [switch]$NoWebSearch,
     [switch]$Stop
 )
 
@@ -84,6 +85,66 @@ function Wait-TcpPort {
     return $false
 }
 
+function Get-PortFromUrl {
+    param(
+        [string]$Url,
+        [int]$DefaultPort = 3210
+    )
+    try {
+        $uri = [System.Uri]$Url
+        if ($uri.Port -gt 0) {
+            return [int]$uri.Port
+        }
+    } catch {
+    }
+    return $DefaultPort
+}
+
+function Test-DockerCompose {
+    try {
+        docker compose version *> $null
+        return ($LASTEXITCODE -eq 0)
+    } catch {
+        return $false
+    }
+}
+
+function Get-NpmCommand {
+    $cmd = Get-Command npm.cmd -ErrorAction SilentlyContinue
+    if (-not $cmd) {
+        $cmd = Get-Command npm -ErrorAction SilentlyContinue
+    }
+    if ($cmd) {
+        return $cmd.Source
+    }
+    return ""
+}
+
+function Invoke-Npm {
+    param(
+        [string[]]$Arguments,
+        [string]$WorkingDirectory,
+        [string]$Name
+    )
+    $npm = Get-NpmCommand
+    if (-not $npm) {
+        Write-Host "[warn] npm not found. Skip $Name." -ForegroundColor Yellow
+        return $false
+    }
+    Write-Host "[run] npm $($Arguments -join ' ') ($Name)..." -ForegroundColor Cyan
+    $p = Start-Process -FilePath $npm `
+        -ArgumentList $Arguments `
+        -WorkingDirectory $WorkingDirectory `
+        -NoNewWindow `
+        -Wait `
+        -PassThru
+    if ($p.ExitCode -ne 0) {
+        Write-Host "[warn] npm command failed for $Name, exit=$($p.ExitCode)" -ForegroundColor Yellow
+        return $false
+    }
+    return $true
+}
+
 function Start-PythonServer {
     param(
         [string]$Name,
@@ -118,6 +179,116 @@ function Start-PythonServer {
     }
 }
 
+function Start-OpenWebSearchDocker {
+    param(
+        [int]$Port
+    )
+    if (-not (Test-DockerCompose)) {
+        Write-Host "[warn] Docker Compose is not available. Try local npm fallback for open-webSearch." -ForegroundColor Yellow
+        return $false
+    }
+
+    $oldOpenWebSearchPort = $env:OPEN_WEBSEARCH_PORT
+    $env:OPEN_WEBSEARCH_PORT = "$Port"
+    try {
+        Write-Host "[build] docker compose build --progress plain open-websearch..." -ForegroundColor Cyan
+        docker compose build --progress plain open-websearch
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "[warn] docker compose build failed for open-webSearch, exit=$LASTEXITCODE" -ForegroundColor Yellow
+            return $false
+        }
+        Write-Host "[start] docker compose up -d --no-build open-websearch..." -ForegroundColor Cyan
+        docker compose up -d --no-build open-websearch
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "[warn] docker compose up failed for open-webSearch, exit=$LASTEXITCODE" -ForegroundColor Yellow
+            return $false
+        }
+    } catch {
+        Write-Host "[warn] Docker open-webSearch startup failed: $($_.Exception.Message)" -ForegroundColor Yellow
+        return $false
+    } finally {
+        if ($null -eq $oldOpenWebSearchPort) {
+            Remove-Item Env:\OPEN_WEBSEARCH_PORT -ErrorAction SilentlyContinue
+        } else {
+            $env:OPEN_WEBSEARCH_PORT = $oldOpenWebSearchPort
+        }
+    }
+
+    return (Wait-TcpPort -Name "open-webSearch" -HostName "127.0.0.1" -Port $Port -TimeoutSec 120)
+}
+
+function Start-OpenWebSearchDaemon {
+    $openWebSearchRoot = Join-Path $ProjectRoot "open-webSearch-main"
+    if (-not (Test-Path (Join-Path $openWebSearchRoot "package.json"))) {
+        Write-Host "[skip] open-webSearch project not found: $openWebSearchRoot" -ForegroundColor DarkYellow
+        return
+    }
+
+    $baseUrl = Get-EnvValue -Name "OPEN_WEBSEARCH_BASE_URL" -DefaultValue "http://127.0.0.1:3210"
+    $port = Get-PortFromUrl -Url $baseUrl -DefaultPort 3210
+    if (Test-TcpPort -HostName "127.0.0.1" -Port $port) {
+        Write-Host "[skip] open-webSearch already listening on port $port" -ForegroundColor DarkYellow
+        return
+    }
+
+    if (Start-OpenWebSearchDocker -Port $port) {
+        return
+    }
+
+    Write-Host "[warn] Falling back to local npm for open-webSearch." -ForegroundColor Yellow
+
+    $nodeModules = Join-Path $openWebSearchRoot "node_modules"
+    if (-not (Test-Path $nodeModules)) {
+        if (-not (Invoke-Npm -Arguments @("ci") -WorkingDirectory $openWebSearchRoot -Name "open-webSearch install")) {
+            Write-Host "[warn] open-webSearch dependencies missing. Run npm ci in $openWebSearchRoot." -ForegroundColor Yellow
+            return
+        }
+    }
+
+    $entry = Join-Path $openWebSearchRoot "build\index.js"
+    if (-not (Test-Path $entry)) {
+        if (-not (Invoke-Npm -Arguments @("run", "build") -WorkingDirectory $openWebSearchRoot -Name "open-webSearch build")) {
+            Write-Host "[warn] open-webSearch build missing. Run npm run build in $openWebSearchRoot." -ForegroundColor Yellow
+            return
+        }
+    }
+
+    $npm = Get-NpmCommand
+    if (-not $npm) {
+        Write-Host "[warn] npm not found. Skip open-webSearch daemon." -ForegroundColor Yellow
+        return
+    }
+
+    $outLog = Join-Path $LogDir "open-websearch.out.log"
+    $errLog = Join-Path $LogDir "open-websearch.err.log"
+    Write-Host "[start] open-webSearch daemon (port $port)..." -ForegroundColor Cyan
+    Start-Process -FilePath $npm `
+        -ArgumentList @("run", "serve", "--", "--host", "127.0.0.1", "--port", "$port") `
+        -WindowStyle Hidden `
+        -WorkingDirectory $openWebSearchRoot `
+        -RedirectStandardOutput $outLog `
+        -RedirectStandardError $errLog
+
+    $ok = Wait-TcpPort -Name "open-webSearch" -HostName "127.0.0.1" -Port $port -TimeoutSec 30
+    if (-not $ok) {
+        Write-Host "       stdout: $outLog" -ForegroundColor Yellow
+        Write-Host "       stderr: $errLog" -ForegroundColor Yellow
+    }
+}
+
+function Stop-OpenWebSearchDocker {
+    if (-not (Test-DockerCompose)) {
+        return
+    }
+    try {
+        docker compose stop open-websearch | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "[stop] docker compose service open-websearch" -ForegroundColor DarkYellow
+        }
+    } catch {
+    }
+}
+
 function Stop-PortProcess {
     param(
         [int]$Port
@@ -126,6 +297,15 @@ function Stop-PortProcess {
     foreach ($conn in $connections) {
         $pidToStop = $conn.OwningProcess
         if ($pidToStop -and $pidToStop -ne $PID) {
+            $processName = ""
+            try {
+                $processName = (Get-Process -Id $pidToStop -ErrorAction SilentlyContinue).ProcessName
+            } catch {
+            }
+            if ($processName -match '(?i)docker') {
+                Write-Host "[skip] port=$Port is owned by Docker process '$processName'" -ForegroundColor DarkYellow
+                continue
+            }
             try {
                 Stop-Process -Id $pidToStop -Force -ErrorAction SilentlyContinue
                 Write-Host "[stop] port=$Port pid=$pidToStop" -ForegroundColor DarkYellow
@@ -154,6 +334,7 @@ function Test-HttpReady {
 
 if ($Stop) {
     Write-Host "[stop] stopping multi_agent services..." -ForegroundColor Yellow
+    Stop-OpenWebSearchDocker
     Get-CimInstance Win32_Process | Where-Object {
         $_.CommandLine -and (
             $_.CommandLine -like "*$ProjectRoot*" -or
@@ -167,7 +348,8 @@ if ($Stop) {
         } catch {
         }
     }
-    8005,8006,8008,8009,8011,9900 | ForEach-Object {
+    $openWebSearchStopPort = Get-PortFromUrl -Url (Get-EnvValue -Name "OPEN_WEBSEARCH_BASE_URL" -DefaultValue "http://127.0.0.1:3210") -DefaultPort 3210
+    8005,8006,8008,8009,8011,9900,$openWebSearchStopPort | ForEach-Object {
         Stop-PortProcess -Port $_
     }
     Write-Host "[stop] done" -ForegroundColor Green
@@ -224,6 +406,12 @@ if (-not $NoRedis) {
     }
 } else {
     Write-Host "[skip] Redis auto-start disabled by -NoRedis" -ForegroundColor DarkYellow
+}
+
+if (-not $NoWebSearch) {
+    Start-OpenWebSearchDaemon
+} else {
+    Write-Host "[skip] open-webSearch auto-start disabled by -NoWebSearch" -ForegroundColor DarkYellow
 }
 
 if (-not $NoMcp) {

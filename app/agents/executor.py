@@ -21,6 +21,7 @@ from app.runtime.permissions import (
     PermissionMode,
     parse_permission_mode,
 )
+from app.runtime.agent_harness import get_agent_harness
 from app.runtime.tool_filter import filter_tools_for_skill
 from app.runtime.tool_runner import run_parallel_agent
 from app.runtime.transitions import (
@@ -29,7 +30,6 @@ from app.runtime.transitions import (
     EXECUTOR_TOOL_ERROR,
     make_transition,
 )
-from app.agents.prompts import EXECUTOR_SYSTEM_PROMPT, EXECUTOR_TASK_TEMPLATE
 from app.agents.state import PlanExecuteState
 from app.agents.stream_sink import emit as emit_stream, set_step
 from app.config import settings
@@ -59,7 +59,8 @@ def _get_executor(
         selected_skill_name, get_all_tools(), mode=perm_mode
     )
     tool_names = tuple(t.name for t in tools)
-    runner_mode = "parallel" if settings.executor_parallel_enabled else "serial"
+    harness = get_agent_harness()
+    runner_mode = "parallel" if harness.executor_parallel_enabled() else "serial"
     cache_key = (selected_skill_name or "", tool_names, runner_mode, perm_mode.value)
 
     if cache_key not in _agent_cache:
@@ -69,7 +70,7 @@ def _get_executor(
         )
         # Executor 跑得最频繁 (每步一次 LLM, 多步累计 5-10 次), 是延迟瓶颈.
         # 默认走 agent_executor_model (推荐配 flash); 留空则回退 dashscope_chat_model.
-        executor_model = settings.agent_executor_model or settings.dashscope_chat_model
+        executor_model = harness.executor_model()
         if runner_mode == "parallel":
             # streaming=True 很关键:
             #   1. 前端 mon-stream 才能看到打字机效果 (否则 astream 退化成一次性大 chunk)
@@ -81,7 +82,7 @@ def _get_executor(
             _agent_cache[cache_key] = create_agent(
                 model=get_chat_llm(model=executor_model, temperature=0, streaming=True),
                 tools=tools,
-                system_prompt=EXECUTOR_SYSTEM_PROMPT,
+                system_prompt=harness.executor_system_prompt(),
             )
 
     return runner_mode, _agent_cache[cache_key], tools, decisions
@@ -110,9 +111,10 @@ async def execute_node(state: PlanExecuteState) -> PlanExecuteState:
     })
 
     # 防死循环: 硬性步数上限
-    if iteration > settings.agent_max_steps:
+    harness = get_agent_harness()
+    if iteration > harness.max_agent_steps():
         logger.warning(
-            f"[Executor] 已达最大步数 {settings.agent_max_steps}, 强制返回兜底结果"
+            f"[Executor] 已达最大步数 {harness.max_agent_steps()}, 强制返回兜底结果"
         )
         logger.warning(f"[transition] node=executor reason={EXECUTOR_MAX_STEPS} detail=iteration={iteration}")
         return {
@@ -125,14 +127,12 @@ async def execute_node(state: PlanExecuteState) -> PlanExecuteState:
 
     selected_skill_name = state.get("selected_skill", "")
     perm_mode = parse_permission_mode(
-        state.get("permission_mode") or settings.permission_mode
+        state.get("permission_mode") or harness.default_permission_mode()
     )
     runner_mode, executor, tools, decisions = _get_executor(selected_skill_name, perm_mode)
 
-    # 把整体计划 + 当前步骤组装成 user message
-    plan_text = "\n".join(f"  {i+1}. {s}" for i, s in enumerate(plan))
-    task_prompt = EXECUTOR_TASK_TEMPLATE.format(
-        plan_text=plan_text,
+    task_prompt = harness.build_executor_task_prompt(
+        plan=plan,
         step_index=iteration,
         total_steps=total_steps,
         current_step=current_step,
@@ -143,13 +143,14 @@ async def execute_node(state: PlanExecuteState) -> PlanExecuteState:
     try:
         if runner_mode == "parallel":
             llm, parallel_tools = executor
+            policy = harness.executor_policy()
             result = await run_parallel_agent(
                 llm=llm,
                 tools=parallel_tools,
-                system_prompt=EXECUTOR_SYSTEM_PROMPT,
+                system_prompt=harness.executor_system_prompt(),
                 inputs={"messages": [("user", task_prompt)]},
-                max_iters=settings.executor_max_iters,
-                max_parallel=settings.executor_max_parallel,
+                max_iters=policy.max_iters,
+                max_parallel=policy.max_parallel,
                 decisions=decisions,
             )
         else:

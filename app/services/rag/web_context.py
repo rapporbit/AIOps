@@ -15,7 +15,7 @@ from typing import Any
 from loguru import logger
 
 from app.config import settings
-from app.core.web_search import format_results, search
+from app.core.web_search import format_results, get_provider, search
 import app.services.chat_memory as chat_memory
 
 
@@ -49,6 +49,20 @@ _REPORT_TERM_STOPWORDS = {
     "cpu", "gpu", "ram", "mb", "gb", "kb", "ms", "pid",
     "what", "why", "how", "the", "and", "for", "with", "this", "that",
 }
+
+_WEB_QUERY_PREFIX_RE = re.compile(
+    r"^\s*(?:请)?(?:帮我)?(?:联网(?:搜索|查询|查找|看看|看一下|查一下)?|搜索|查询|查找|查一下|看一下)[：:\s，,、-]*",
+    re.IGNORECASE,
+)
+
+def _normalize_web_query(query: str) -> str:
+    normalized = re.sub(r"\s+", " ", query.strip())
+    for _ in range(3):
+        updated = _WEB_QUERY_PREFIX_RE.sub("", normalized).strip()
+        if updated == normalized:
+            break
+        normalized = updated
+    return normalized
 
 
 def _allowed_web_keywords() -> list[str]:
@@ -113,31 +127,13 @@ def build_restricted_web_query(
     if block_reason:
         return "", [], block_reason
 
-    query = re.sub(r"\s+", " ", rewritten_question.strip())
+    query = _normalize_web_query(rewritten_question)
     if not query:
         return "", [], "查询为空"
 
-    parts: list[str] = [summary or ""]
-    parts.extend(
-        str(m.get("content") or "")
-        for m in recent_messages
-        if m.get("role") == "assistant"
-    )
-    if extra_reports:
-        parts.extend(extra_reports)
-    report_text = "\n".join(parts)
-    if not report_text.strip():
-        return "", [], "没有可用于限定联网范围的历史诊断报告"
-
-    query_terms = _extract_report_terms(query)
-    report_terms = _extract_report_terms(report_text)
-    matched_terms = [term for term in query_terms if term in report_terms]
-    if not matched_terms:
-        return "", [], "当前问题未命中前面诊断报告中的实体/术语"
-
     topics = _extract_web_topics(rewritten_question)
     if not topics:
-        topics = matched_terms[:3]
+        topics = list(_extract_report_terms(query))[:3]
 
     return query[:180].strip(), topics, ""
 
@@ -179,7 +175,7 @@ async def build_web_context(
         logger.info(f"[rag-web] skip | topics={topics} | reason={blocked}")
         return f"(联网搜索已跳过: {blocked})", [], [], blocked
 
-    provider = (settings.web_search_provider or "mock").lower().strip()
+    provider = get_provider()
     max_results = max(1, min(settings.rag_chat_web_search_max_results, 5))
     logger.info(
         f"[rag-web] search | provider={provider} | topics={topics} | query={query!r}"

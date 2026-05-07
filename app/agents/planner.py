@@ -11,11 +11,10 @@
 
 from loguru import logger
 
-from app.agents.prompts import PLANNER_SYSTEM_PROMPT, PLANNER_USER_PROMPT
 from app.agents.state import Plan, PlanExecuteState
-from app.config import settings
 from app.core.llm import get_chat_llm
 from app.core.structured import ainvoke_structured
+from app.runtime.agent_harness import get_agent_harness
 from app.runtime.transitions import (
     PLANNER_EMPTY_STEPS,
     PLANNER_LLM_FAILED,
@@ -44,20 +43,15 @@ async def plan_node(state: PlanExecuteState) -> PlanExecuteState:
             f"[Planner] 开始拆分任务 (skill={skill.name}): {user_input[:100]}..."
         )
 
-    # Planner 走轻量模型: 只做结构化输出, 不需要 qwen-max 那种推理力.
-    planner_model = settings.agent_planner_model or settings.dashscope_router_model
+    harness = get_agent_harness()
+    planner_model = harness.planner_model()
     llm = get_chat_llm(model=planner_model, temperature=0, timeout=30, max_retries=1)
 
-    user_prompt = PLANNER_USER_PROMPT.format(
-        input=user_input,
+    messages = harness.build_planner_messages(
+        user_input=user_input,
         skill_display_name=skill.display_name,
         skill_playbook=skill.playbook,
     )
-
-    messages = [
-        {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
-        {"role": "user", "content": user_prompt},
-    ]
 
     try:
         plan = await ainvoke_structured(
@@ -71,10 +65,7 @@ async def plan_node(state: PlanExecuteState) -> PlanExecuteState:
         logger.exception(f"[Planner] 结构化输出失败, 使用 fallback 计划: {e}")
         logger.warning(f"[transition] node=planner reason={PLANNER_LLM_FAILED} detail={detail}")
         return {
-            "plan": [
-                "查询知识库, 寻找类似问题的处理经验",
-                "汇总现有信息, 给出诊断结论",
-            ],
+            "plan": harness.planner_fallback_plan("llm_failed"),
             "iteration": 0,
             "pending_reroute": False,  # 清标记, 避免下轮误路由
             "transition_history": [make_transition("planner", PLANNER_LLM_FAILED, detail)],
@@ -84,7 +75,7 @@ async def plan_node(state: PlanExecuteState) -> PlanExecuteState:
         logger.warning("[Planner] LLM 返回空 steps, 使用 fallback")
         logger.warning(f"[transition] node=planner reason={PLANNER_EMPTY_STEPS}")
         return {
-            "plan": ["汇总现有信息, 给出诊断结论"],
+            "plan": harness.planner_fallback_plan("empty_plan"),
             "iteration": 0,
             "pending_reroute": False,
             "transition_history": [make_transition("planner", PLANNER_EMPTY_STEPS, "LLM 返回空 steps")],

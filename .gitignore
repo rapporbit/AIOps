@@ -1,43 +1,45 @@
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
 # Python
 __pycache__/
 *.py[cod]
 *.pyo
-*.pyd
-*.egg-info/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-.coverage
-htmlcov/
-
-# Virtual environments
 .venv/
 venv/
-env/
 
-# Environment and secrets
-.env
-.env.*
-!.env.example
-*.pem
-*.key
-*.crt
-secrets.*
-
-# Runtime data
+# Logs / runtime
 logs/
 *.log
-*.log.*
-data/alert_history.jsonl
-volumes/
-.kb_clone_tmp/
+*.log.err
+*.out.log
+*.err.log
 
-# Local editor / OS
+# Docker / databases / local state
+volumes/
+data/milvus/
+data/redis/
+data/minio/
+data/etcd/
+
+# Node / open-webSearch
+node_modules/
+open-webSearch-main/node_modules/
+open-webSearch-main/build/
+open-webSearch-main/dist/
+open-webSearch-main/*.log
+
+# IDE / OS
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
 
-# Generated reports and test artifacts
-benchmark_results/
-tests/
+# Test run artifacts
+tests/__*.log
+tests/__*.log.err

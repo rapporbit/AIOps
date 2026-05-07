@@ -19,18 +19,19 @@
 """
 
 import asyncio
+import time
 from typing import Any, AsyncIterator, Dict
 
 from loguru import logger
 
 from app.agents import build_aiops_graph
 from app.agents.stream_sink import set_sink
-from app.config import settings
+from app.runtime.agent_harness import HarnessUsageStats, get_agent_harness
 import app.services.chat_memory as chat_memory
 
 # 模块级单例 (图编译有开销, 不要每次请求都建)
 _graph = None
-_agent_semaphore = asyncio.Semaphore(settings.agent_max_concurrency)
+_agent_semaphore = asyncio.Semaphore(get_agent_harness().agent_max_concurrency())
 
 
 def _get_graph():
@@ -65,12 +66,16 @@ async def stream_diagnose(
             "error",
             "concurrency_limited",
             message="当前诊断任务较多，请稍后重试",
-            max_concurrency=settings.agent_max_concurrency,
+            max_concurrency=get_agent_harness().agent_max_concurrency(),
         )
         return
 
     async with _agent_semaphore:
         logger.info(f"[aiops] session={session_id} | query={query[:100]}...")
+        harness = get_agent_harness()
+        total_t0 = time.perf_counter()
+        input_tokens = output_tokens = total_tokens = 0
+        tool_calls_count = tool_ms = 0
 
         yield _make_event(
             "start",
@@ -92,7 +97,7 @@ async def stream_diagnose(
             try:
                 async for event in graph.astream(
                     {"input": query},
-                    config={"recursion_limit": settings.agent_max_steps * 3 + 5},
+                    config={"recursion_limit": harness.graph_recursion_limit()},
                 ):
                     await token_queue.put({"__node__": event})
             except asyncio.CancelledError:
@@ -149,8 +154,42 @@ async def stream_diagnose(
                 # 其他都是 Executor 推出来的 token/step_start/tool_call 事件, 直接转 SSE.
                 etype = item.get("type", "token")
                 payload = {k: v for k, v in item.items() if k != "type"}
+                if etype == "usage":
+                    input_tokens += int(payload.get("input_tokens") or 0)
+                    output_tokens += int(payload.get("output_tokens") or 0)
+                    total_tokens += int(payload.get("total_tokens") or 0)
+                elif etype == "tool_call":
+                    tool_calls_count += 1
+                    tool_ms += int(payload.get("elapsed_ms") or 0)
                 yield _make_event(etype, etype, message="", **payload)
 
+            total_ms = int((time.perf_counter() - total_t0) * 1000)
+            if total_tokens == 0:
+                total_tokens = input_tokens + output_tokens
+            usage_stats = HarnessUsageStats(
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=total_tokens,
+                total_ms=total_ms,
+                tool_calls=tool_calls_count,
+                tool_ms=tool_ms,
+                run_kind="aiops_diagnosis",
+            )
+            budget_event = harness.build_budget_event(harness.evaluate_budget(usage_stats))
+            if budget_event:
+                yield _make_event(
+                    budget_event["type"],
+                    budget_event["stage"],
+                    message=budget_event.get("detail", ""),
+                    **(budget_event.get("data") or {}),
+                )
+            stats_event = harness.build_usage_stats_event(usage_stats)
+            yield _make_event(
+                stats_event["type"],
+                stats_event["stage"],
+                message=stats_event.get("detail", ""),
+                **(stats_event.get("data") or {}),
+            )
             yield _make_event(
                 "complete", "diagnosis_complete", message="诊断流程完成"
             )

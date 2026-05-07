@@ -162,7 +162,7 @@ TOOL_META: Dict[str, ToolMeta] = {
     # ===== 联网搜索 (websearch_server.py) =====
     "web_search": ToolMeta(
         read_only=True,
-        # 注意: 不并发. tavily/ddgs 限频, 多实例并发容易触发 429.
+        # 注意: 不并发. 外部搜索/本地 daemon 都应避免被 LLM 批量打爆.
         concurrency_safe=False,
         side_effect="network",
         max_result_chars=12000,
