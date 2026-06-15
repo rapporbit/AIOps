@@ -168,11 +168,24 @@ app.include_router(approvals.router, prefix=API_PREFIX)
 # ============================================================
 # 静态文件 (前端)
 # ============================================================
+# 现代 SaaS 仪表盘前端: 已成为唯一前端, 由 "/" 提供。
+class NoCacheStaticFiles(StaticFiles):
+    """带 no-cache 的静态文件: 浏览器每次用 etag 重新校验, 改前端后刷新立即生效。
+
+    前端频繁迭代, 用这个避免浏览器拿旧缓存导致样式/逻辑不更新。
+    """
+
+    async def get_response(self, path, scope):
+        resp = await super().get_response(path, scope)
+        resp.headers["Cache-Control"] = "no-cache, must-revalidate"
+        return resp
+
+
 FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
 if FRONTEND_DIR.exists():
     app.mount(
         "/",
-        StaticFiles(directory=str(FRONTEND_DIR), html=True),
+        NoCacheStaticFiles(directory=str(FRONTEND_DIR), html=True),
         name="frontend",
     )
 else:
