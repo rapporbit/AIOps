@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Multi-Agent AIOps Platform V3 · 数据库 ER 图</title>
+<style>
+  :root {
+    --bg: #faf9f5; --bg2: #ffffff; --card: #ffffff;
+    --ctp: #1a1a18; --cts: #5f5e5a;
+    --border: rgba(0,0,0,0.12);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1f1e1b; --bg2: #262521; --card: #262521;
+      --ctp: #f0eee6; --cts: #b4b2a9;
+      --border: rgba(255,255,255,0.14);
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px 20px 64px; background: var(--bg); color: var(--ctp);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    line-height: 1.65;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; }
+  h1 { font-size: 26px; margin: 0 0 4px; }
+  h2 { font-size: 19px; margin: 40px 0 4px; }
+  .sub { color: var(--cts); margin: 0 0 8px; font-size: 14px; }
+  .card { background: var(--card); border: 0.5px solid var(--border);
+          border-radius: 16px; padding: 20px; margin: 16px 0 24px; }
+  p, li { color: var(--ctp); font-size: 15px; }
+  strong { font-weight: 600; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+         background: var(--bg2); border: 0.5px solid var(--border);
+         border-radius: 5px; padding: 1px 5px; font-size: 13px; }
+  ul { padding-left: 22px; }
+  #erd { width: 100%; overflow-x: auto; }
+  #erd svg { max-width: 100%; height: auto; }
+  #erd svg.erDiagram .divider path { stroke-opacity: 0.5; }
+  #erd svg.erDiagram .row-rect-odd path,
+  #erd svg.erDiagram .row-rect-odd rect,
+  #erd svg.erDiagram .row-rect-even path,
+  #erd svg.erDiagram .row-rect-even rect { stroke: none !important; }
+  .fallback { color: var(--cts); font-size: 14px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Multi-Agent AIOps Platform V3 · 数据库 ER 图</h1>
+  <p class="sub">PostgreSQL 共 9 张表(源自 <code>app/db/postgres.py</code> 的 <code>_SCHEMA_SQL</code>),以 <code>incident_groups</code> 为中心枢纽。</p>
+
+  <div class="card">
+    <div id="erd"><p class="fallback">正在加载 ER 图…(需要联网加载 mermaid。若长时间空白,请检查网络或用支持 ES module 的现代浏览器打开。)</p></div>
+  </div>
+
+  <h2>关系拓扑</h2>
+  <ul>
+    <li><strong>多对多</strong>:<code>alerts</code> 与 <code>incident_groups</code> 通过关联表 <code>incident_group_alerts</code> 连接(一条告警可进多个组,一个组聚多条告警)。</li>
+    <li><strong>一对多</strong>:<code>incident_groups</code> 展开 <code>incidents</code>、<code>diagnosis_tasks</code>、<code>evidence</code>。</li>
+    <li><strong>诊断主链</strong>:<code>diagnosis_tasks → agent_runs → tool_calls</code>(任务派生多个 Agent 运行,每个运行调用多个工具)。</li>
+    <li><strong>无 FK 约束</strong>:<code>approval_requests</code> 仅以字段持有 <code>task_id</code> / <code>agent_run_id</code>,无外键约束(图中用虚线表示)。</li>
+  </ul>
+
+  <h2>实现细节</h2>
+  <ul>
+    <li><strong>冗余外键</strong>:<code>agent_runs</code> / <code>tool_calls</code> 还各自持有 <code>incident_group_id</code> 外键,便于按组聚合查询(图中省略)。</li>
+    <li><strong>删除行为</strong>:挂在 <code>incident_groups</code> 下的子表多为 <code>ON DELETE CASCADE</code>(删组级联清理);而 <code>evidence.incident_id</code>、<code>agent_runs.task_id</code> 等用 <code>ON DELETE SET NULL</code>(子记录可独立存活)。</li>
+    <li><strong>幂等去重</strong>:<code>diagnosis_tasks</code> 用 <code>dedup_key</code> + 部分唯一索引(仅 <code>pending/running</code> 时生效)实现入队去重。</li>
+    <li><strong>类型约定</strong>:主键/外键均为 <code>TEXT</code>;标签、注解、payload、元数据等用 <code>JSONB</code>;时间戳统一 <code>TIMESTAMPTZ</code>。</li>
+  </ul>
+</div>
+
+<script type="module">
+import mermaid from 'https://esm.sh/mermaid@11/dist/mermaid.esm.min.mjs';
+const dark = matchMedia('(prefers-color-scheme: dark)').matches;
+await document.fonts.ready;
+mermaid.initialize({
+  startOnLoad: false,
+  theme: 'base',
+  fontFamily: '"Anthropic Sans", sans-serif',
+  themeVariables: {
+    darkMode: dark,
+    fontSize: '13px',
+    fontFamily: '"Anthropic Sans", sans-serif',
+    lineColor: dark ? '#9c9a92' : '#73726c',
+    textColor: dark ? '#c2c0b6' : '#3d3d3a',
+  },
+});
+const { svg } = await mermaid.render('erd-svg', `erDiagram
+  incident_groups ||--o{ incident_group_alerts : groups
+  alerts ||--o{ incident_group_alerts : tagged
+  incident_groups ||--o{ incidents : contains
+  incident_groups ||--o{ diagnosis_tasks : triggers
+  incidents ||--o{ diagnosis_tasks : scopes
+  incident_groups ||--o{ evidence : collects
+  incidents ||--o{ evidence : supports
+  diagnosis_tasks ||--o{ agent_runs : spawns
+  agent_runs ||--o{ tool_calls : invokes
+  diagnosis_tasks ||..o{ approval_requests : "asks (no FK)"
+
+  alerts {
+    text id PK
+    text fingerprint
+    text status
+    text service
+    text severity
+    jsonb labels
+  }
+  incident_groups {
+    text id PK
+    text correlation_key UK
+    text status
+    text primary_service
+    int alert_count
+  }
+  incident_group_alerts {
+    text incident_group_id FK
+    text alert_id FK
+  }
+  incidents {
+    text id PK
+    text incident_group_id FK
+    text status
+    text service
+  }
+  diagnosis_tasks {
+    text id PK
+    text incident_group_id FK
+    text incident_id FK
+    text status
+    text diagnosis_mode
+    int priority
+  }
+  evidence {
+    text id PK
+    text incident_group_id FK
+    text incident_id FK
+    text source
+    float score
+  }
+  agent_runs {
+    text id PK
+    text task_id FK
+    text agent_name
+    text status
+    int total_tokens
+  }
+  tool_calls {
+    text id PK
+    text agent_run_id FK
+    text tool_name
+    text status
+    int elapsed_ms
+  }
+  approval_requests {
+    text id PK
+    text task_id
+    text tool_name
+    text status
+  }`);
+document.getElementById('erd').innerHTML = svg;
+
+document.querySelectorAll('#erd svg.erDiagram .node').forEach(node => {
+  const firstPath = node.querySelector('path[d]');
+  if (!firstPath) return;
+  const d = firstPath.getAttribute('d');
+  const nums = d.match(/-?[\d.]+/g)?.map(Number);
+  if (!nums || nums.length < 8) return;
+  const xs = [nums[0], nums[2], nums[4], nums[6]];
+  const ys = [nums[1], nums[3], nums[5], nums[7]];
+  const x = Math.min(...xs), y = Math.min(...ys);
+  const w = Math.max(...xs) - x, h = Math.max(...ys) - y;
+  const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+  rect.setAttribute('x', x); rect.setAttribute('y', y);
+  rect.setAttribute('width', w); rect.setAttribute('height', h);
+  rect.setAttribute('rx', '8');
+  for (const a of ['fill', 'stroke', 'stroke-width', 'class', 'style']) {
+    if (firstPath.hasAttribute(a)) rect.setAttribute(a, firstPath.getAttribute(a));
+  }
+  firstPath.replaceWith(rect);
+});
+document.querySelectorAll('#erd svg.erDiagram .row-rect-odd path, #erd svg.erDiagram .row-rect-even path').forEach(p => {
+  p.setAttribute('stroke', 'none');
+});
+</script>
+</body>
+</html>

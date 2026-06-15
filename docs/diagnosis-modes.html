@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Multi-Agent AIOps Platform V3 · Fast / Deep 双诊断模式可视化</title>
+<style>
+  :root {
+    --bg: #faf9f5; --bg2: #ffffff; --card: #ffffff;
+    --ctp: #1a1a18; --cts: #5f5e5a; --cline: #888780;
+    --border: rgba(0,0,0,0.12);
+    --blue-f:#E6F1FB; --blue-s:#185FA5; --blue-t:#0C447C; --blue-st:#185FA5;
+    --purple-f:#EEEDFE; --purple-s:#534AB7; --purple-t:#3C3489; --purple-st:#534AB7;
+    --teal-f:#E1F5EE; --teal-s:#0F6E56; --teal-t:#085041; --teal-st:#0F6E56;
+    --coral-f:#FAECE7; --coral-s:#993C1D; --coral-t:#712B13; --coral-st:#993C1D;
+    --gold-f:#FAF1DC; --gold-s:#8A6A1A; --gold-t:#6B5111; --gold-st:#8A6A1A;
+    --gray-f:#F1EFE8; --gray-s:#5F5E5A; --gray-t:#444441; --gray-st:#5F5E5A;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1f1e1b; --bg2: #262521; --card: #262521;
+      --ctp: #f0eee6; --cts: #b4b2a9; --cline: #888780;
+      --border: rgba(255,255,255,0.14);
+      --blue-f:#0C447C; --blue-s:#85B7EB; --blue-t:#B5D4F4; --blue-st:#85B7EB;
+      --purple-f:#3C3489; --purple-s:#AFA9EC; --purple-t:#CECBF6; --purple-st:#AFA9EC;
+      --teal-f:#085041; --teal-s:#5DCAA5; --teal-t:#9FE1CB; --teal-st:#5DCAA5;
+      --coral-f:#712B13; --coral-s:#F0997B; --coral-t:#F5C4B3; --coral-st:#F0997B;
+      --gold-f:#5C4711; --gold-s:#E0BE6A; --gold-t:#F1DBA6; --gold-st:#E0BE6A;
+      --gray-f:#444441; --gray-s:#B4B2A9; --gray-t:#D3D1C7; --gray-st:#B4B2A9;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px 20px 64px; background: var(--bg);
+    color: var(--ctp);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    line-height: 1.65;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; }
+  h1 { font-size: 26px; margin: 0 0 4px; }
+  h2 { font-size: 19px; margin: 44px 0 4px; }
+  h3 { font-size: 16px; margin: 28px 0 4px; }
+  .sub { color: var(--cts); margin: 0 0 8px; font-size: 14px; }
+  .card { background: var(--card); border: 0.5px solid var(--border);
+          border-radius: 16px; padding: 20px; margin: 16px 0 24px; }
+  p, li { color: var(--ctp); font-size: 15px; }
+  strong { font-weight: 600; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+         background: var(--bg2); border: 0.5px solid var(--border);
+         border-radius: 5px; padding: 1px 5px; font-size: 13px; }
+  ul { padding-left: 22px; }
+  a { color: var(--blue-st); }
+
+  /* badges */
+  .tag { display:inline-block; font-size:12px; font-weight:600; border-radius:6px;
+         padding:1px 8px; margin-right:6px; border:0.5px solid var(--border); }
+  .tag-fast { background: var(--purple-f); color: var(--purple-t); border-color: var(--purple-s); }
+  .tag-deep { background: var(--teal-f); color: var(--teal-t); border-color: var(--teal-s); }
+  .tag-llm  { background: var(--coral-f); color: var(--coral-t); border-color: var(--coral-s); }
+  .tag-rule { background: var(--gold-f); color: var(--gold-t); border-color: var(--gold-s); }
+
+  /* table */
+  table { border-collapse: collapse; width: 100%; font-size: 14px; margin: 4px 0; }
+  th, td { border: 0.5px solid var(--border); padding: 8px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--bg2); font-weight: 600; }
+  thead th:nth-child(2) { color: var(--purple-t); }
+  thead th:nth-child(3) { color: var(--teal-t); }
+
+  /* SVG text classes */
+  svg .t  { font-size: 14px; font-weight: 400; fill: var(--ctp); }
+  svg .th { font-size: 14px; font-weight: 500; fill: var(--ctp); }
+  svg .ts { font-size: 12px; font-weight: 400; fill: var(--cts); }
+  svg .tn { font-size: 11px; font-weight: 400; fill: var(--cts); }
+  svg .arr { stroke: var(--cline); stroke-width: 1.5; fill: none; }
+  svg .arr-dash { stroke: var(--cline); stroke-width: 1.5; fill: none; stroke-dasharray: 5 4; }
+  svg .box rect, svg rect.box { fill: var(--bg2); stroke: var(--border); stroke-width: 0.5; }
+  svg .box .ts { fill: var(--cts); }
+  svg .node { cursor: default; }
+  svg text.lbl { font-size: 11px; font-weight: 500; }
+
+  svg .c-blue rect, svg .c-blue circle, svg .c-blue polygon { fill: var(--blue-f); stroke: var(--blue-s); }
+  svg .c-blue .t, svg .c-blue .th { fill: var(--blue-t); }
+  svg .c-blue .ts { fill: var(--blue-st); }
+  svg .c-purple rect, svg .c-purple circle, svg .c-purple polygon { fill: var(--purple-f); stroke: var(--purple-s); }
+  svg .c-purple .t, svg .c-purple .th { fill: var(--purple-t); }
+  svg .c-purple .ts { fill: var(--purple-st); }
+  svg .c-teal rect, svg .c-teal circle, svg .c-teal polygon { fill: var(--teal-f); stroke: var(--teal-s); }
+  svg .c-teal .t, svg .c-teal .th { fill: var(--teal-t); }
+  svg .c-teal .ts { fill: var(--teal-st); }
+  svg .c-coral rect, svg .c-coral circle, svg .c-coral polygon { fill: var(--coral-f); stroke: var(--coral-s); }
+  svg .c-coral .t, svg .c-coral .th { fill: var(--coral-t); }
+  svg .c-coral .ts { fill: var(--coral-st); }
+  svg .c-gold rect, svg .c-gold circle, svg .c-gold polygon { fill: var(--gold-f); stroke: var(--gold-s); }
+  svg .c-gold .t, svg .c-gold .th { fill: var(--gold-t); }
+  svg .c-gold .ts { fill: var(--gold-st); }
+  svg .c-gray rect, svg .c-gray circle, svg .c-gray polygon { fill: var(--gray-f); stroke: var(--gray-s); }
+  svg .c-gray .t, svg .c-gray .th { fill: var(--gray-t); }
+  svg .c-gray .ts { fill: var(--gray-st); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Fast / Deep 双诊断模式 · 可视化详解</h1>
+  <p class="sub">Multi-Agent AIOps Platform V3 · L4 智能体层 · <code>DiagnosisMode = {fast, deep}</code></p>
+
+  <div class="card">
+    <p style="margin:0 0 8px"><span class="tag tag-fast">fast</span> <strong>快速闭环</strong> — 单 Skill 智能体的 Plan → Execute → Replan 循环,每步由 LLM 决策、可反思可重规划,适合日常诊断与通用排障。</p>
+    <p style="margin:0"><span class="tag tag-deep">deep</span> <strong>深度根因</strong> — 多 Agent 并行取证 → 确定性归并打分 → LLM 根因裁决 → 处置建议的有向图,结构化证据链全程可追溯,适合生产重大故障的 RCA。</p>
+  </div>
+
+  <h2>一、模式路由 · 一次请求如何分流</h2>
+  <p class="sub">请求携带 <code>diagnosis_mode</code>。<code>resolve_effective_mode()</code> 受全局开关 <code>deep_diagnosis_enabled</code> 约束:deep 在开关开启时走独立 Deep 图,否则回落 fast 并打 <code>group_agent_reserved</code> 标记。</p>
+  <div class="card">
+    <svg width="100%" viewBox="0 0 680 340" role="img" xmlns="http://www.w3.org/2000/svg">
+      <title>诊断模式路由分流</title>
+      <desc>请求经 normalize 与 resolve_effective_mode 判定,fast 走 Plan-Execute-Replan 图,deep 在开关开启时走 Deep Diagnosis 图,关闭时回落 fast。</desc>
+      <defs>
+        <marker id="ar" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </marker>
+      </defs>
+      <g class="node c-gray"><rect x="40" y="30" width="180" height="48" rx="8" stroke-width="0.5"/>
+        <text class="th" x="130" y="48" text-anchor="middle" dominant-baseline="central">诊断请求</text>
+        <text class="ts" x="130" y="66" text-anchor="middle" dominant-baseline="central">diagnosis_mode = fast / deep</text></g>
+      <line x1="220" y1="54" x2="262" y2="54" class="arr" marker-end="url(#ar)"/>
+      <g class="node c-blue"><polygon points="330,24 412,54 330,84 248,54" stroke-width="0.5"/>
+        <text class="th" x="330" y="48" text-anchor="middle" dominant-baseline="central">resolve</text>
+        <text class="ts" x="330" y="64" text-anchor="middle" dominant-baseline="central">effective_mode</text></g>
+
+      <!-- fast branch -->
+      <path d="M330 84 L330 110 L170 110 L170 134" class="arr" marker-end="url(#ar)"/>
+      <text class="lbl" x="176" y="104" fill="var(--purple-st)">requested = fast</text>
+      <g class="node c-purple"><rect x="40" y="136" width="260" height="56" rx="10" stroke-width="0.5"/>
+        <text class="th" x="170" y="156" text-anchor="middle" dominant-baseline="central">Plan-Execute-Replan 图</text>
+        <text class="ts" x="170" y="174" text-anchor="middle" dominant-baseline="central">get_diagnosis_graph()</text></g>
+
+      <!-- deep branch -->
+      <path d="M412 54 L470 54" class="arr" marker-end="url(#ar)"/>
+      <g class="node c-teal"><polygon points="540,20 624,54 540,88 456,54" stroke-width="0.5"/>
+        <text class="th" x="540" y="48" text-anchor="middle" dominant-baseline="central">deep_enabled?</text>
+        <text class="ts" x="540" y="64" text-anchor="middle" dominant-baseline="central">全局开关</text></g>
+      <path d="M540 88 L540 134" class="arr" marker-end="url(#ar)"/>
+      <text class="lbl" x="548" y="112" fill="var(--teal-st)">True</text>
+      <g class="node c-teal"><rect x="410" y="136" width="260" height="56" rx="10" stroke-width="0.5"/>
+        <text class="th" x="540" y="156" text-anchor="middle" dominant-baseline="central">Deep Diagnosis 图</text>
+        <text class="ts" x="540" y="174" text-anchor="middle" dominant-baseline="central">get_deep_diagnosis_graph()</text></g>
+
+      <!-- fallback -->
+      <path d="M456 54 L350 54 L350 134" class="arr-dash" marker-end="url(#ar)"/>
+      <text class="lbl" x="356" y="120" fill="var(--coral-st)">False → 回落 fast</text>
+
+      <line x1="170" y1="192" x2="170" y2="222" class="arr" marker-end="url(#ar)"/>
+      <line x1="540" y1="192" x2="540" y2="222" class="arr" marker-end="url(#ar)"/>
+      <g class="node c-coral"><rect x="40" y="224" width="630" height="50" rx="10" stroke-width="0.5"/>
+        <text class="th" x="355" y="242" text-anchor="middle" dominant-baseline="central">统一执行:分布式执行槽限流 → 图 .astream() → SSE 事件流 → 报告落库 + Wiki 沉淀</text>
+        <text class="ts" x="355" y="260" text-anchor="middle" dominant-baseline="central">app/orchestration/diagnosis_runner.py · app/services/aiops_service.py</text></g>
+
+      <text class="tn" x="40" y="300">关键文件:app/orchestration/diagnosis_runner.py:80-166 · app/incidents/models.py:24 · app/config.py:189</text>
+      <text class="tn" x="40" y="318">回落语义:deep 被请求但开关关闭 → effective=fast,标记 group_agent_reserved=True 供前端提示"已降级"。</text>
+    </svg>
+  </div>
+
+  <h2 id="fast">二、Fast 模式 · Plan-Execute-Replan 循环</h2>
+  <p class="sub">单一 Skill 智能体的动态规划闭环。Skill Router 选方向 → Planner 出 4-6 步计划 → Executor 逐步取证 → Replanner 复盘,可继续 / 切 Skill / 收尾。带防死循环计数与 Harness 强制收敛。</p>
+  <div class="card">
+    <svg width="100%" viewBox="0 0 680 560" role="img" xmlns="http://www.w3.org/2000/svg">
+      <title>Fast 模式执行图</title>
+      <desc>START 进入 Skill Router,可快速路径直达 END;否则 Planner 生成计划,Executor 执行单步,Replanner 评估后继续执行下一步、回 Planner 切 Skill 或收尾结束。</desc>
+      <defs>
+        <marker id="arf" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </marker>
+      </defs>
+
+      <!-- START -->
+      <g class="node c-gray"><circle cx="120" cy="40" r="20" stroke-width="0.5"/>
+        <text class="ts" x="120" y="40" text-anchor="middle" dominant-baseline="central">START</text></g>
+      <line x1="120" y1="60" x2="120" y2="84" class="arr" marker-end="url(#arf)"/>
+
+      <!-- Skill Router -->
+      <g class="node c-purple"><rect x="40" y="86" width="160" height="58" rx="10" stroke-width="0.5"/>
+        <text class="th" x="120" y="106" text-anchor="middle" dominant-baseline="central">① Skill Router</text>
+        <text class="ts" x="120" y="124" text-anchor="middle" dominant-baseline="central">选诊断方向 + 经验召回</text></g>
+      <!-- fast path to END -->
+      <path d="M200 100 L320 100 L320 60" class="arr-dash" marker-end="url(#arf)"/>
+      <text class="lbl" x="210" y="92" fill="var(--coral-st)">已有 response → 快速路径</text>
+      <g class="node c-gray"><circle cx="320" cy="40" r="20" stroke-width="0.5"/>
+        <text class="ts" x="320" y="40" text-anchor="middle" dominant-baseline="central">END</text></g>
+
+      <line x1="120" y1="144" x2="120" y2="168" class="arr" marker-end="url(#arf)"/>
+
+      <!-- Planner -->
+      <g class="node c-purple"><rect x="40" y="170" width="160" height="58" rx="10" stroke-width="0.5"/>
+        <text class="th" x="120" y="190" text-anchor="middle" dominant-baseline="central">② Planner</text>
+        <text class="ts" x="120" y="208" text-anchor="middle" dominant-baseline="central">Playbook → 4-6 步计划</text></g>
+      <line x1="120" y1="228" x2="120" y2="252" class="arr" marker-end="url(#arf)"/>
+
+      <!-- Executor -->
+      <g class="node c-purple"><rect x="40" y="254" width="160" height="58" rx="10" stroke-width="0.5"/>
+        <text class="th" x="120" y="274" text-anchor="middle" dominant-baseline="central">③ Executor</text>
+        <text class="ts" x="120" y="292" text-anchor="middle" dominant-baseline="central">执行 plan[0] · 工具并行</text></g>
+      <line x1="120" y1="312" x2="120" y2="336" class="arr" marker-end="url(#arf)"/>
+
+      <!-- Replanner -->
+      <g class="node c-purple"><rect x="40" y="338" width="160" height="58" rx="10" stroke-width="0.5"/>
+        <text class="th" x="120" y="358" text-anchor="middle" dominant-baseline="central">④ Replanner</text>
+        <text class="ts" x="120" y="376" text-anchor="middle" dominant-baseline="central">复盘 · 输出 Act 决策</text></g>
+
+      <!-- decision diamond -->
+      <line x1="200" y1="367" x2="262" y2="367" class="arr" marker-end="url(#arf)"/>
+      <g class="node c-teal"><polygon points="360,330 450,367 360,404 270,367" stroke-width="0.5"/>
+        <text class="th" x="360" y="361" text-anchor="middle" dominant-baseline="central">should_end?</text>
+        <text class="ts" x="360" y="377" text-anchor="middle" dominant-baseline="central">Act 路由</text></g>
+
+      <!-- continue: back to Executor -->
+      <path d="M360 404 L360 470 L120 470 L120 314" class="arr" marker-end="url(#arf)"/>
+      <text class="lbl" x="150" y="486" fill="var(--teal-st)">continue · is_finished=false → 下一步</text>
+
+      <!-- reroute: back to Planner -->
+      <path d="M450 367 L500 367 L500 199 L202 199" class="arr-dash" marker-end="url(#arf)"/>
+      <text class="lbl" x="320" y="216" fill="var(--gold-st)">pending_reroute → 切 Skill 重规划</text>
+
+      <!-- finish: to END -->
+      <path d="M360 330 L360 280 L600 280 L600 40 L342 40" class="arr" marker-end="url(#arf)"/>
+      <text class="lbl" x="470" y="272" fill="var(--coral-st)">finish · is_finished=true → 报告</text>
+
+      <!-- annotations box -->
+      <g class="box"><rect x="40" y="500" width="600" height="48" rx="8"/>
+        <text class="ts" x="52" y="518" dominant-baseline="central">防护:iteration 计数 + agent_max_steps(默认 5)强制收敛 · reroute_count ≤ agent_max_reroutes(默认 1) · tried_skills 黑名单防回切</text>
+        <text class="tn" x="52" y="536" dominant-baseline="central">app/agents/graph.py:56-136 · planner.py · executor.py · replanner.py:207-320 · state.py:34-157</text></g>
+    </svg>
+  </div>
+
+  <h3>Fast 节点逐一</h3>
+  <table>
+    <thead><tr><th>节点</th><th>职责</th><th>关键机制</th></tr></thead>
+    <tbody>
+      <tr><td><strong>① Skill Router</strong><br><span class="tag tag-llm">LLM</span></td>
+        <td>从告警 + 历史经验选中对应 Skill,确定本次诊断方向。</td>
+        <td>快速路径:简单问题直接产 <code>response</code> 跳过后续;查不到回退 <code>generic_oncall</code>。</td></tr>
+      <tr><td><strong>② Planner</strong><br><span class="tag tag-llm">LLM</span></td>
+        <td>从 <code>Skill.playbook</code> 提取种子,LLM 生成 4-6 步具体计划写入 <code>state.plan</code>。</td>
+        <td>LLM 失败用 <code>planner_fallback_plan()</code> 兜底,保证总能出计划。</td></tr>
+      <tr><td><strong>③ Executor</strong><br><span class="tag tag-llm">LLM</span></td>
+        <td>执行 <code>plan[0]</code>,调用工具收集信息,结果 <code>(step,result)</code> 追加进 <code>past_steps</code>。</td>
+        <td>默认并行:只读工具按 <code>ToolMeta.concurrency_safe</code> 分批 <code>asyncio.gather</code>;可回落串行链路。</td></tr>
+      <tr><td><strong>④ Replanner</strong><br><span class="tag tag-llm">LLM</span></td>
+        <td>评估进度,输出 <code>Act</code>:continue / finish / reroute。</td>
+        <td>快速路径:剩余步数多且上步成功时跳过 LLM 直接继续(<code>fast_path_threshold</code>);超 <code>agent_max_steps</code> 强制收尾。</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="deep">三、Deep 模式 · 多 Agent 并行取证有向图</h2>
+  <p class="sub">串行前段建立上下文 → 规则路由派遣专业 Agent → fan-out 并行取证 → join 归并打分 → LLM 根因裁决 → 规则化处置 → 纯格式化报告。确定性优先,LLM 只在 RCA 一处兜决策。</p>
+  <div class="card">
+    <svg width="100%" viewBox="0 0 680 700" role="img" xmlns="http://www.w3.org/2000/svg">
+      <title>Deep 模式执行图</title>
+      <desc>Incident Manager → Correlation Context → Evidence Plan,随后并行派出 Log/Metric/Infra/Runbook 四个隔离 subagent 取证,join 后经 Evidence Reducer 打分、RCA Judge 裁决、Remediation Planner 出处置、Report 渲染报告至 END。</desc>
+      <defs>
+        <marker id="ard" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </marker>
+      </defs>
+
+      <g class="node c-gray"><circle cx="340" cy="34" r="18" stroke-width="0.5"/>
+        <text class="ts" x="340" y="34" text-anchor="middle" dominant-baseline="central">START</text></g>
+      <line x1="340" y1="52" x2="340" y2="70" class="arr" marker-end="url(#ard)"/>
+
+      <!-- serial front -->
+      <g class="node c-teal"><rect x="220" y="72" width="240" height="44" rx="9" stroke-width="0.5"/>
+        <text class="th" x="340" y="88" text-anchor="middle" dominant-baseline="central">① Incident Manager</text>
+        <text class="ts" x="340" y="104" text-anchor="middle" dominant-baseline="central">载入诊断对象 / task 元信息</text></g>
+      <line x1="340" y1="116" x2="340" y2="132" class="arr" marker-end="url(#ard)"/>
+      <g class="node c-teal"><rect x="220" y="134" width="240" height="44" rx="9" stroke-width="0.5"/>
+        <text class="th" x="340" y="150" text-anchor="middle" dominant-baseline="central">② Correlation Context</text>
+        <text class="ts" x="340" y="166" text-anchor="middle" dominant-baseline="central">同组告警聚合 + Wiki 召回</text></g>
+      <line x1="340" y1="178" x2="340" y2="194" class="arr" marker-end="url(#ard)"/>
+      <g class="node c-gold"><rect x="220" y="196" width="240" height="44" rx="9" stroke-width="0.5"/>
+        <text class="th" x="340" y="212" text-anchor="middle" dominant-baseline="central">③ Evidence Plan</text>
+        <text class="ts" x="340" y="228" text-anchor="middle" dominant-baseline="central">关键词规则 → 派哪几个 Agent</text></g>
+
+      <!-- fan-out -->
+      <path d="M340 240 L340 256 L100 256 L100 280" class="arr" marker-end="url(#ard)"/>
+      <path d="M340 240 L340 256 L260 256 L260 280" class="arr" marker-end="url(#ard)"/>
+      <path d="M340 240 L340 256 L420 256 L420 280" class="arr" marker-end="url(#ard)"/>
+      <path d="M340 240 L340 256 L580 256 L580 280" class="arr" marker-end="url(#ard)"/>
+      <text class="lbl" x="360" y="252" fill="var(--gold-st)">fan-out · 并行</text>
+
+      <g class="node c-coral"><rect x="32" y="282" width="136" height="54" rx="9" stroke-width="0.5"/>
+        <text class="th" x="100" y="300" text-anchor="middle" dominant-baseline="central">Log Agent</text>
+        <text class="ts" x="100" y="318" text-anchor="middle" dominant-baseline="central">log_excerpt</text></g>
+      <g class="node c-coral"><rect x="192" y="282" width="136" height="54" rx="9" stroke-width="0.5"/>
+        <text class="th" x="260" y="300" text-anchor="middle" dominant-baseline="central">Metric Agent</text>
+        <text class="ts" x="260" y="318" text-anchor="middle" dominant-baseline="central">metric_snapshot</text></g>
+      <g class="node c-coral"><rect x="352" y="282" width="136" height="54" rx="9" stroke-width="0.5"/>
+        <text class="th" x="420" y="300" text-anchor="middle" dominant-baseline="central">Infra Agent</text>
+        <text class="ts" x="420" y="318" text-anchor="middle" dominant-baseline="central">infra_snapshot</text></g>
+      <g class="node c-coral"><rect x="512" y="282" width="136" height="54" rx="9" stroke-width="0.5"/>
+        <text class="th" x="580" y="300" text-anchor="middle" dominant-baseline="central">Runbook Agent</text>
+        <text class="ts" x="580" y="318" text-anchor="middle" dominant-baseline="central">runbook_match</text></g>
+
+      <!-- join -->
+      <path d="M100 336 L100 360 L340 360 L340 376" class="arr" marker-end="url(#ard)"/>
+      <path d="M260 336 L260 360" class="arr"/>
+      <path d="M420 336 L420 360" class="arr"/>
+      <path d="M580 336 L580 360 L340 360" class="arr"/>
+      <text class="lbl" x="362" y="356" fill="var(--teal-st)">join · evidences 经 operator.add 合并</text>
+
+      <!-- serial back -->
+      <g class="node c-gold"><rect x="220" y="378" width="240" height="44" rx="9" stroke-width="0.5"/>
+        <text class="th" x="340" y="394" text-anchor="middle" dominant-baseline="central">④ Evidence Reducer</text>
+        <text class="ts" x="340" y="410" text-anchor="middle" dominant-baseline="central">去重 + 评分 → 候选 top-5</text></g>
+      <line x1="340" y1="422" x2="340" y2="438" class="arr" marker-end="url(#ard)"/>
+      <g class="node c-coral"><rect x="220" y="440" width="240" height="44" rx="9" stroke-width="0.5"/>
+        <text class="th" x="340" y="456" text-anchor="middle" dominant-baseline="central">⑤ RCA Judge</text>
+        <text class="ts" x="340" y="472" text-anchor="middle" dominant-baseline="central">LLM 排序候选 + 判定理由</text></g>
+      <line x1="340" y1="484" x2="340" y2="500" class="arr" marker-end="url(#ard)"/>
+      <g class="node c-gold"><rect x="220" y="502" width="240" height="44" rx="9" stroke-width="0.5"/>
+        <text class="th" x="340" y="518" text-anchor="middle" dominant-baseline="central">⑥ Remediation Planner</text>
+        <text class="ts" x="340" y="534" text-anchor="middle" dominant-baseline="central">规则模板 · 写操作需人工确认</text></g>
+      <line x1="340" y1="546" x2="340" y2="562" class="arr" marker-end="url(#ard)"/>
+      <g class="node c-blue"><rect x="220" y="564" width="240" height="44" rx="9" stroke-width="0.5"/>
+        <text class="th" x="340" y="580" text-anchor="middle" dominant-baseline="central">⑦ Report</text>
+        <text class="ts" x="340" y="596" text-anchor="middle" dominant-baseline="central">无 LLM · 纯 Markdown 渲染</text></g>
+      <line x1="340" y1="608" x2="340" y2="624" class="arr" marker-end="url(#ard)"/>
+      <g class="node c-gray"><circle cx="340" cy="642" r="18" stroke-width="0.5"/>
+        <text class="ts" x="340" y="642" text-anchor="middle" dominant-baseline="central">END</text></g>
+
+      <!-- legend -->
+      <g class="c-gold"><rect x="32" y="664" width="12" height="12" rx="3"/></g>
+      <text class="tn" x="48" y="670" dominant-baseline="central">规则 / 确定性</text>
+      <g class="c-coral"><rect x="170" y="664" width="12" height="12" rx="3"/></g>
+      <text class="tn" x="186" y="670" dominant-baseline="central">LLM 取证 / 裁决</text>
+      <g class="c-teal"><rect x="320" y="664" width="12" height="12" rx="3"/></g>
+      <text class="tn" x="336" y="670" dominant-baseline="central">上下文聚合</text>
+      <g class="c-blue"><rect x="450" y="664" width="12" height="12" rx="3"/></g>
+      <text class="tn" x="466" y="670" dominant-baseline="central">格式化输出</text>
+    </svg>
+  </div>
+
+  <h3>Deep 节点逐一</h3>
+  <table>
+    <thead><tr><th>节点</th><th>职责</th><th>关键机制</th></tr></thead>
+    <tbody>
+      <tr><td><strong>① Incident Manager</strong><br><span class="tag tag-rule">规则</span></td>
+        <td>Worker 路径从 Postgres 查 task,充实 <code>incident_group_id / incident_id</code>;SSE 手动路径直接放行。</td>
+        <td>DB 异常不抛,仅记 transition 降级。</td></tr>
+      <tr><td><strong>② Correlation Context</strong><br><span class="tag tag-llm">LLM</span></td>
+        <td>聚合同组其它告警 + LLM Wiki 经验召回,告诉 RCA "这不是孤立事件"。</td>
+        <td>双保险 fallback,无依赖也能产 evidence。</td></tr>
+      <tr><td><strong>③ Evidence Plan</strong><br><span class="tag tag-rule">规则</span></td>
+        <td>关键词匹配决定派遣集合:cpu/mem→metric,log/error→log,docker/dns→infra+log,sop→runbook。</td>
+        <td>强信号("全面诊断")广播全部;无匹配默认 metric+log;<code>_dispatch_guard</code> 跳过未派遣 Agent。</td></tr>
+      <tr><td><strong>四个专业 Agent</strong><br><span class="tag tag-llm">LLM · 并行</span></td>
+        <td>Log / Metric / Infra / Runbook 四个隔离一次性 subagent,各自只产对应类型 Evidence。</td>
+        <td><code>operator.add</code> reducer 让多 Agent 并发写 <code>evidences</code> 自动合并,互不干扰。</td></tr>
+      <tr><td><strong>④ Evidence Reducer</strong><br><span class="tag tag-rule">规则</span></td>
+        <td>每条 evidence → 候选,按类型基础分降序 (metric 1.0 > infra 0.90 > log 0.85 > runbook 0.75 > history 0.60),截 top-5。</td>
+        <td>error evidence 标记保留供识别失败,确定性无 LLM。</td></tr>
+      <tr><td><strong>⑤ RCA Judge</strong><br><span class="tag tag-llm">LLM</span></td>
+        <td>"SRE 根因判定法官",只看 evidence summary 不看原文,输出 root_cause / ranked / reasoning / confidence。</td>
+        <td>LLM 失败取 Reducer 最高分候选确定性兜底。</td></tr>
+      <tr><td><strong>⑥ Remediation Planner</strong><br><span class="tag tag-rule">规则</span></td>
+        <td>按技术关键词 (redis/mysql…) 匹配处置模板,每步标 <code>[只读]</code> 或 <code>[写操作·需人工]</code>。</td>
+        <td>硬约束:任何写操作 <code>requires_human_confirm=True</code>。</td></tr>
+      <tr><td><strong>⑦ Report</strong><br><span class="tag tag-rule">无 LLM</span></td>
+        <td>纯格式化:现象 / 根因 / 候选 / 证据链 (引用 [ev_i]) / 处置 / 元数据。</td>
+        <td>全链路可追溯,Agent 成功失败统计入报告。</td></tr>
+    </tbody>
+  </table>
+
+  <h2>四、双模式对比</h2>
+  <div class="card" style="padding:12px">
+  <table>
+    <thead><tr><th>维度</th><th>fast · 快速闭环</th><th>deep · 深度 RCA</th></tr></thead>
+    <tbody>
+      <tr><td>图结构</td><td>单 Agent · Plan-Execute-Replan <strong>循环</strong></td><td>多 Agent · 串行→fan-out→join→串行 <strong>有向无环</strong></td></tr>
+      <tr><td>入口节点</td><td>Skill Router</td><td>Incident Manager</td></tr>
+      <tr><td>决策范式</td><td>每步 LLM 动态决策 + 反思</td><td>规则路由为主,LLM 仅 RCA 一处</td></tr>
+      <tr><td>取证编排</td><td>逐步增量,单步内工具并行</td><td>一批 fan-out,4 Agent 完全并行</td></tr>
+      <tr><td>证据处理</td><td>串行累积进 past_steps</td><td>Reducer 评分去重 → top-5 候选</td></tr>
+      <tr><td>根因判定</td><td>Replanner 收尾时隐含生成</td><td>专门 RCA Judge 节点(LLM + 确定性兜底)</td></tr>
+      <tr><td>处置建议</td><td>报告中隐含</td><td>专门 Remediation Planner + 人工确认闸门</td></tr>
+      <tr><td>报告生成</td><td>LLM 动态生成</td><td>Report 节点纯格式化(无 LLM)</td></tr>
+      <tr><td>故障恢复</td><td>reroute 切 Skill 重规划</td><td>各节点确定性降级兜底</td></tr>
+      <tr><td>LLM 调用量</td><td>多(Router/Planner/Executor/Replanner 多轮)</td><td>少(仅 Correlation + RCA Judge)</td></tr>
+      <tr><td>典型耗时</td><td>较长 · 多轮迭代</td><td>较短 · 一批并行</td></tr>
+      <tr><td>适用场景</td><td>日常诊断 · 通用排障</td><td>生产重大故障 · 需完整证据链追溯</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2>五、关键配置</h2>
+  <table>
+    <thead><tr><th>参数</th><th>默认</th><th>作用</th></tr></thead>
+    <tbody>
+      <tr><td><code>deep_diagnosis_enabled</code></td><td>True</td><td>deep 是否走独立 Deep 图,关闭则回落 fast</td></tr>
+      <tr><td><code>agent_max_steps</code></td><td>5</td><td><span class="tag tag-fast">fast</span> 最大步数,防死循环强制收敛</td></tr>
+      <tr><td><code>agent_max_reroutes</code></td><td>1</td><td><span class="tag tag-fast">fast</span> Skill 切换上限</td></tr>
+      <tr><td><code>agent_replanner_fast_path_threshold</code></td><td>2</td><td><span class="tag tag-fast">fast</span> Replanner 跳过 LLM 的剩余步数门槛</td></tr>
+      <tr><td><code>agent_planner_model / executor_model / report_model</code></td><td>—</td><td><span class="tag tag-fast">fast</span> 分阶段模型:planner 便宜快 · executor flash · report pro</td></tr>
+    </tbody>
+  </table>
+
+  <h2>六、源码索引</h2>
+  <ul>
+    <li><strong>共享</strong>:<code>app/orchestration/diagnosis_runner.py:80-166</code>(路由+选图) · <code>app/incidents/models.py:24</code>(枚举) · <code>app/config.py:189</code>(开关) · <code>app/api/v1/aiops.py:109-170</code>(入口)</li>
+    <li><strong>fast</strong>:<code>app/agents/graph.py:56-136</code> · <code>state.py:34-157</code> · <code>skill_router.py</code> · <code>planner.py:27-100</code> · <code>executor.py:46-80</code> · <code>replanner.py:207-320</code></li>
+    <li><strong>deep</strong>:<code>app/diagnosis_graphs/deep_diagnosis_graph.py:1-938</code>(8 节点) · <code>app/agents/state_deep.py:25-57</code> · <code>app/agents/{log,metric,infra,runbook}_agent.py</code></li>
+  </ul>
+
+  <p class="sub" style="margin-top:32px">配套阅读:<code>docs/architecture-overview.html</code> · <code>docs/layers/04-agent-layer.md</code> · <code>docs/layers/04a-skill-system.md</code></p>
+</div>
+<script>window.sendPrompt = function(){};</script>
+</body>
+</html>
