@@ -7,7 +7,7 @@
 #
 # 做的事:
 #   1) 确保 Docker daemon (OrbStack) 在跑, 没跑就尝试拉起并等待就绪
-#   2) docker compose 起基础设施 (redis/postgres/etcd/minio/milvus/open-websearch)
+#   2) docker compose 起基础设施 (redis/postgres[ParadeDB]/open-websearch)
 #   3) scripts/run_all.sh 起 MCP 工具 + 多-worker API + N 个诊断 Worker
 #   4) 轮询 /health/ready 确认全部依赖就绪
 #
@@ -62,11 +62,11 @@ echo "[start] Docker daemon OK"
 
 # ---- 2) 基础设施 ----
 echo "[start] 启动基础设施容器..."
-docker compose up -d redis postgres etcd minio standalone open-websearch
+docker compose up -d redis postgres open-websearch
 
 # 等容器真正 healthy 再起应用。OrbStack 冷启动时会陆续恢复/重启容器,
 # 只 ping 一次就起 Worker 容易撞上 "Redis 刚被重启" 的竞态导致 Worker 崩溃。
-echo "[start] 等待 Redis / Milvus 容器 healthy..."
+echo "[start] 等待 Redis / Postgres 容器 healthy..."
 wait_healthy() {
   local cname="$1" tries="${2:-60}"
   for _ in $(seq 1 "$tries"); do
@@ -77,8 +77,8 @@ wait_healthy() {
   done
   return 1
 }
-wait_healthy multi-agent-redis  || echo "[start] ⚠️ Redis 未在预期时间内 healthy, 继续尝试..."
-wait_healthy multi-agent-milvus || echo "[start] ⚠️ Milvus 未在预期时间内 healthy, 继续尝试..."
+wait_healthy multi-agent-redis    || echo "[start] ⚠️ Redis 未在预期时间内 healthy, 继续尝试..."
+wait_healthy multi-agent-postgres || echo "[start] ⚠️ Postgres 未在预期时间内 healthy, 继续尝试..."
 # 额外静置 2s, 让冷启动阶段的容器彻底稳定
 sleep 2
 

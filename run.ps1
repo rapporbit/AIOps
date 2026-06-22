@@ -2,7 +2,7 @@
 # Multi-Agent AIOps Platform - Windows launcher
 # ============================================================
 # Startup order:
-#   1. Start / check Milvus container
+#   1. Start / check Postgres (ParadeDB) container — vector store (pgvector) + ledger
 #   2. Start / check Redis container (RAG Chat session memory)
 #   3. Start MCP servers in background
 #   4. Wait for MCP ports
@@ -11,14 +11,14 @@
 # Usage:
 #   .\run.ps1
 #   .\run.ps1 -NoMcp
-#   .\run.ps1 -NoMilvus
+#   .\run.ps1 -NoPostgres
 #   .\run.ps1 -NoRedis
 #   .\run.ps1 -Stop
 # ============================================================
 
 param(
     [switch]$NoMcp,
-    [switch]$NoMilvus,
+    [switch]$NoPostgres,
     [switch]$NoRedis,
     [switch]$NoWebSearch,
     [switch]$Stop
@@ -373,19 +373,20 @@ if (-not (Test-Path "$ProjectRoot\.env")) {
 $AppPortText = Get-EnvValue -Name "PORT" -DefaultValue "9900"
 $AppPort = [int]$AppPortText
 
-if (-not $NoMilvus) {
-    Write-Host "[check] Milvus (localhost:19530)..." -ForegroundColor Cyan
-    if (-not (Test-TcpPort -HostName "127.0.0.1" -Port 19530)) {
+if (-not $NoPostgres) {
+    $PgPort = [int](Get-EnvValue -Name "POSTGRES_PORT" -DefaultValue "5432")
+    Write-Host "[check] Postgres/ParadeDB (localhost:$PgPort)..." -ForegroundColor Cyan
+    if (-not (Test-TcpPort -HostName "127.0.0.1" -Port $PgPort)) {
         try {
-            Write-Host "[start] docker compose up -d standalone..." -ForegroundColor Cyan
-            docker compose up -d standalone
+            Write-Host "[start] docker compose up -d postgres..." -ForegroundColor Cyan
+            docker compose up -d postgres
         } catch {
-            Write-Host "[warn] Docker is not available or docker compose failed. Milvus may be unavailable." -ForegroundColor Yellow
+            Write-Host "[warn] Docker is not available or docker compose failed. Postgres (vector store + ledger) may be unavailable." -ForegroundColor Yellow
         }
     }
-    Wait-TcpPort -Name "Milvus" -HostName "127.0.0.1" -Port 19530 -TimeoutSec 90 | Out-Null
+    Wait-TcpPort -Name "Postgres" -HostName "127.0.0.1" -Port $PgPort -TimeoutSec 90 | Out-Null
 } else {
-    Write-Host "[skip] Milvus auto-start disabled by -NoMilvus" -ForegroundColor DarkYellow
+    Write-Host "[skip] Postgres auto-start disabled by -NoPostgres" -ForegroundColor DarkYellow
 }
 
 if (-not $NoRedis) {

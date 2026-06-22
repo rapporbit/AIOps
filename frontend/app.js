@@ -69,7 +69,7 @@ async function checkHealth() {
     const dot = $("health-dot"), txt = $("health-text");
     if (ready && mcp.status === "ok") { dot.className = "dot is-ok"; txt.textContent = `就绪 · MCP ${mcp.tools_count || 0} 工具`; }
     else if (ready) { dot.className = "dot is-warn"; txt.textContent = "就绪 · MCP 未连"; }
-    else { dot.className = "dot is-err"; txt.textContent = "Milvus 不可用"; }
+    else { dot.className = "dot is-err"; txt.textContent = "依赖未就绪"; }
   } catch { $("health-dot").className = "dot is-err"; $("health-text").textContent = "服务不可达"; }
 }
 checkHealth(); setInterval(checkHealth, 15000);
