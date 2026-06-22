@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 from app.api.v1.documents import require_kb_admin_token
 from app.schemas.common import ApiResponse
 import app.services.kb_source_service as kb_source_service
+import app.services.kb_sync_service as kb_sync_service
 
 router = APIRouter(prefix="/kb", tags=["kb-sources"])
 
@@ -78,6 +79,21 @@ async def list_sources() -> ApiResponse:
             for s in sources
         ]
     )
+
+
+@router.post(
+    "/sources/{source_id}/sync",
+    response_model=ApiResponse,
+    summary="触发一次同步 (同步执行)",
+    description="拉取数据源 → 解析 → 增量写入 pgvector。本期同步内联执行, 返回统计。",
+    dependencies=[Depends(require_kb_admin_token)],
+)
+async def sync_source(source_id: str) -> ApiResponse:
+    source = await kb_source_service.get_source(source_id)
+    if not source:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="数据源不存在")
+    stats = await kb_sync_service.sync_source(source)
+    return ApiResponse.success(data=stats, message="同步完成")
 
 
 @router.post(

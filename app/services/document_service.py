@@ -43,6 +43,41 @@ ALLOWED_EXTENSIONS = TEXT_EXTENSIONS | set(MINERU_EXTENSIONS)
 
 
 # ============================================================
+# 归一化: 任意格式字节 → markdown (上传 / 同步引擎共用)
+# ============================================================
+async def normalize_to_markdown(
+    raw: bytes, filename: str, *, need_ocr: bool | None = None
+) -> str:
+    """把文件字节归一化成 markdown 文本。
+
+    - .md/.markdown/.txt: 直接按 UTF-8 解码
+    - 其他受支持格式: 经 MinerU 解析 (need_ocr 不传则按扩展名默认)
+
+    Raises:
+        UnsupportedFileTypeError: 空文件 / 编码错误 / 不支持的扩展名 / 过大 (客户端错误)
+        ParseError: MinerU 解析失败 (由调用方决定转 503 还是标记 failed)
+    """
+    if not raw:
+        raise UnsupportedFileTypeError("文件为空")
+    ext = _get_extension(filename)
+    if ext in TEXT_EXTENSIONS:
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError as e:
+            raise UnsupportedFileTypeError(f"文件不是 UTF-8 编码: {e}") from e
+    if ext in MINERU_EXTENSIONS:
+        if len(raw) > settings.mineru_max_bytes:
+            raise UnsupportedFileTypeError(
+                f"文件过大 ({len(raw)} 字节), 超过上限 {settings.mineru_max_bytes}"
+            )
+        ocr = MINERU_EXTENSIONS[ext] if need_ocr is None else need_ocr
+        return await mineru_parser.to_markdown(raw, filename=filename, need_ocr=ocr)
+    raise UnsupportedFileTypeError(
+        f"不支持的文件类型 '{ext}', 支持 {sorted(ALLOWED_EXTENSIONS)}"
+    )
+
+
+# ============================================================
 # 上传
 # ============================================================
 async def upload_document(file: UploadFile) -> UploadResponse:
@@ -61,26 +96,12 @@ async def upload_document(file: UploadFile) -> UploadResponse:
     bytes_count = len(raw)
     logger.info(f"[document] 收到上传: {filename} ({bytes_count} bytes)")
 
-    # 归一化成 markdown 文本
-    if ext in TEXT_EXTENSIONS:
-        # md/txt 直通
-        try:
-            content = raw.decode("utf-8")
-        except UnicodeDecodeError as e:
-            raise UnsupportedFileTypeError(f"文件不是 UTF-8 编码: {e}") from e
-    else:
-        # 其他格式经 MinerU 解析。大小预检 (客户端错误); 解析失败 → 503 拒收, 不入库。
-        if bytes_count > settings.mineru_max_bytes:
-            raise UnsupportedFileTypeError(
-                f"文件过大 ({bytes_count} 字节), 超过上限 {settings.mineru_max_bytes}"
-            )
-        try:
-            content = await mineru_parser.to_markdown(
-                raw, filename=filename, need_ocr=MINERU_EXTENSIONS[ext]
-            )
-        except ParseError as e:
-            logger.warning(f"[document] MinerU 解析失败 {filename}: {e}")
-            raise DocumentParseError(detail=str(e)) from e
+    # 归一化成 markdown (md/txt 直通, 其他经 MinerU)。解析失败 → 503 拒收, 不入库。
+    try:
+        content = await normalize_to_markdown(raw, filename)
+    except ParseError as e:
+        logger.warning(f"[document] MinerU 解析失败 {filename}: {e}")
+        raise DocumentParseError(detail=str(e)) from e
 
     # 分块
     chunks = split_markdown(content, source=filename)
