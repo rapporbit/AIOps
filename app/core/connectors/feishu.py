@@ -105,39 +105,14 @@ class FeishuConnector:
 
     # ---------------- list_changes ----------------
     async def list_changes(self, source: KbSource) -> List[DocRef]:
-        """两种模式 (按 config 自动选择):
+        """整库枚举: BFS 遍历知识库 (space) 全部节点, 按类型白名单过滤。
 
-        - node_tokens: [...]  指定文档列表模式。只需对每篇文档有"协作者"权限,
-          逐个 get_node 取元信息。适合无法把应用加为知识库成员的租户。
-        - space_id: "..."     整库枚举模式。需应用是知识库 (space) 成员。
+        需应用是知识库 (space) 成员。
         """
-        node_tokens = source.config.get("node_tokens") or []
-        if node_tokens:
-            return await self._list_by_nodes(node_tokens)
         space_id = str(source.config.get("space_id") or "").strip()
         if not space_id:
-            raise FeishuError("kb_source.config 需要 node_tokens 或 space_id 之一")
-        return await self._list_by_space(space_id)
+            raise FeishuError("kb_source.config 缺少 space_id")
 
-    async def _list_by_nodes(self, node_tokens: List[str]) -> List[DocRef]:
-        refs: List[DocRef] = []
-        skipped = 0
-        timeout = httpx.Timeout(settings.feishu_timeout_sec)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            for tk in node_tokens:
-                node = await self._get_node(client, tk)
-                obj_type = (node.get("obj_type") or "").lower()
-                if obj_type not in _SUPPORTED:
-                    skipped += 1
-                    logger.info(
-                        f"[feishu] 跳过不支持类型 obj_type={obj_type} title={node.get('title')!r}"
-                    )
-                    continue
-                refs.append(self._node_to_ref(node, obj_type))
-        logger.info(f"[feishu] 指定文档: 收录 {len(refs)} 篇, 跳过 {skipped} 个")
-        return refs
-
-    async def _list_by_space(self, space_id: str) -> List[DocRef]:
         refs: List[DocRef] = []
         skipped = 0
         timeout = httpx.Timeout(settings.feishu_timeout_sec)
@@ -160,16 +135,6 @@ class FeishuConnector:
                     refs.append(self._node_to_ref(node, obj_type))
         logger.info(f"[feishu] space={space_id}: 收录 {len(refs)} 篇, 跳过 {skipped} 个")
         return refs
-
-    async def _get_node(self, client: httpx.AsyncClient, token: str) -> Dict[str, Any]:
-        """get_node: 由 wiki 节点 token 取节点元信息 (只需该文档的协作者权限)。"""
-        data = await self._api(
-            client, "GET", "/open-apis/wiki/v2/spaces/get_node", params={"token": token}
-        )
-        node = data.get("node") or {}
-        if not node.get("obj_token"):
-            raise FeishuError(f"get_node 无 obj_token: token={token} data={data}")
-        return node
 
     async def _iter_nodes(
         self, client: httpx.AsyncClient, space_id: str, parent: Optional[str]

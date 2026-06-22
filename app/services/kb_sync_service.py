@@ -134,8 +134,6 @@ async def _finish_run(conn, run_id: int, status: str, stats: dict, error: str = 
 async def sync_source(source: KbSource) -> Dict[str, Any]:
     """同步单个数据源, 返回统计。advisory lock 保证同源串行。"""
     connector = _connector_for(source)
-    # 整库枚举才是"完整快照", 才能据此做删除传播; 指定文档模式不做删除传播。
-    is_full = bool(source.config.get("space_id")) and not source.config.get("node_tokens")
 
     pool = await get_pool()
     lock_key2 = _hash_lock(source.id)
@@ -147,7 +145,7 @@ async def sync_source(source: KbSource) -> Dict[str, Any]:
             logger.warning(f"[kb_sync] source={source.id} 已有同步在跑, 跳过")
             return {"skipped_reason": "locked"}
         try:
-            return await _do_sync(pool, connector, source, is_full)
+            return await _do_sync(pool, connector, source)
         finally:
             await lock_conn.execute(
                 "SELECT pg_advisory_unlock($1, $2)", _SYNC_LOCK_NS, lock_key2
@@ -160,7 +158,7 @@ def _hash_lock(s: str) -> int:
     return h - (1 << 31)  # 落到 int4 [-2^31, 2^31)
 
 
-async def _do_sync(pool, connector: SourceConnector, source: KbSource, is_full: bool) -> Dict[str, Any]:
+async def _do_sync(pool, connector: SourceConnector, source: KbSource) -> Dict[str, Any]:
     stats = {"scanned": 0, "added": 0, "updated": 0, "skipped": 0, "deleted": 0, "failed": 0}
     async with pool.acquire() as conn:
         run_id = await _create_run(conn, source.id)
@@ -220,15 +218,14 @@ async def _do_sync(pool, connector: SourceConnector, source: KbSource, is_full: 
                 )
             stats["failed"] += 1
 
-    # 删除传播 (仅整库模式可信)
-    if is_full:
-        async with pool.acquire() as conn:
-            for d in await _active_documents(conn, source.id):
-                if d["external_id"] not in remote_ids:
-                    await pg_vector_store.delete_by_doc_id(d["id"])
-                    await _soft_delete(conn, d["id"])
-                    stats["deleted"] += 1
-                    logger.info(f"[kb_sync] 删除传播 doc_id={d['id']}")
+    # 删除传播: list_changes 是整库完整快照, 远端消失的文档清向量 + 软删
+    async with pool.acquire() as conn:
+        for d in await _active_documents(conn, source.id):
+            if d["external_id"] not in remote_ids:
+                await pg_vector_store.delete_by_doc_id(d["id"])
+                await _soft_delete(conn, d["id"])
+                stats["deleted"] += 1
+                logger.info(f"[kb_sync] 删除传播 doc_id={d['id']}")
 
     async with pool.acquire() as conn:
         await _finish_run(conn, run_id, "success", stats)
