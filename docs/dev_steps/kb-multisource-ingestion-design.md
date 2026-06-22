@@ -232,11 +232,16 @@ class SourceConnector(Protocol):
   请求头 `Authorization: Bearer {tenant_access_token}`。
   ⚠️ **前置条件**: 必须把应用作为「文档应用/协作者」添加到目标 Wiki 知识库/文件夹，否则列表返回空。
   所需权限 scope: `wiki:wiki(:readonly)`、`docs:doc`、`drive:drive(:readonly)`、`drive:file` (以后台实际名称为准)。
-- **列文件 (`list_changes`)**:
-  - Wiki 源: `GET /open-apis/wiki/v2/spaces/{space_id}/nodes` 分页 (`page_token`/`has_more`，≤50/页)，
-    取 `obj_token` / `obj_type` / `obj_edit_time` / `title`。
+- **列文件 (`list_changes`) — 两种模式 (按 config 自动选)**:
+  - **整库枚举** (`config.space_id`): `GET /open-apis/wiki/v2/spaces/{space_id}/nodes` 分页 BFS 遍历。
+    ⚠️ 需应用是**知识库 (space) 成员**。部分租户不允许把应用加为 space 成员 (成员搜索里只有
+    用户/群组/部门)，此时该接口返回 `131006 wiki space permission denied`，此模式不可用。
+  - **指定文档** (`config.node_tokens`): 对每个 wiki 节点 token 调 `GET /open-apis/wiki/v2/spaces/get_node`
+    取元信息 (obj_token/obj_type/obj_edit_time/title)。**只需对每篇文档有「协作者」权限**，
+    不依赖 space 成员资格。是上面那类租户的可行路径 (已用真实文档验证)。用户在数据源里粘贴
+    wiki 文档链接即可 (`POST /kb/sources` 的 `doc_urls`)。
   - ⚠️ Wiki node 与文档 obj 分离: node 只是挂载点，内容要再用 `obj_token` 调对应文档 API。
-  - 也支持 Drive 文件夹: `GET /open-apis/drive/v1/files` (返回 `modified_time` / `token` / `type`)。
+  - (预留) Drive 文件夹: `GET /open-apis/drive/v1/files` (返回 `modified_time` / `token` / `type`)。
 - **节点类型白名单 (G1)**: Wiki 节点有 docx / sheet / bitable / mindnote / file / 快捷方式 等多种 `obj_type`，
   export_task 也只支持 docx/pdf/xlsx/csv (mindnote 不能导)。本期**只处理 `{docx, doc, file(pdf/图片/office)}`**，
   其余类型 (sheet/bitable/mindnote/shortcut) **跳过并记日志**，不计入 failed。类型映射也决定后续 `need_ocr`。
