@@ -38,9 +38,10 @@ def require_kb_admin_token(
     response_model=ApiResponse[UploadResponse],
     summary="上传文档并建索引",
     description=(
-        "上传 Markdown (`.md`/`.markdown`) 或纯文本 (`.txt`) 文件, "
-        "服务端会自动: 按 H1/H2/H3 切分章节 → 大块再按字符数细切 → "
-        "向量化 → 写入 pgvector."
+        "上传文档自动建索引。`.md`/`.markdown`/`.txt` 直通; "
+        "`.pdf`/`.doc(x)`/`.ppt(x)`/`.html`/图片经 MinerU 解析成 Markdown。"
+        "服务端: (解析→) 按 H1/H2/H3 切分 → 细切 → 向量化 → 幂等写入 pgvector。"
+        "解析失败返回 503 (不入库, 请稍后重试)。"
     ),
     dependencies=[Depends(require_kb_admin_token)],
 )

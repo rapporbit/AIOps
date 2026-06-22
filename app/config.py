@@ -106,6 +106,24 @@ class Settings(BaseSettings):
         description="pg_search BM25 分词器: chinese_compatible / chinese_lindera / icu / jieba",
     )
 
+    # ==================== MinerU 文档解析 (官方在线 API) ====================
+    # 把 pdf/doc(x)/ppt(x)/图片/html 归一化成 Markdown, 复用现有 splitter。
+    # 无 fallback: 解析失败即报错拒收 (上传返回 503, 同步标记 failed 下轮重试)。
+    # 流程: file-urls/batch 申请预签名上传链接 → PUT 上传 → 轮询 batch 结果 → 下载 zip 取 full.md。
+    mineru_api_base: str = Field(default="https://mineru.net", description="MinerU API 根地址")
+    mineru_token: str = Field(default="", description="MinerU API Token (空则拒绝一切解析)")
+    mineru_model_version: str = Field(
+        default="vlm", description="解析后端: pipeline / vlm / MinerU-HTML"
+    )
+    mineru_enable_formula: bool = Field(default=True, description="启用公式识别 (→LaTeX)")
+    mineru_enable_table: bool = Field(default=True, description="启用表格识别 (→HTML)")
+    mineru_language: str = Field(default="ch", description="OCR 语言, 默认中英 ch")
+    mineru_poll_interval_sec: float = Field(default=3.0, description="轮询任务结果间隔秒")
+    mineru_timeout_sec: float = Field(default=300.0, description="单文档解析总超时秒")
+    mineru_max_bytes: int = Field(
+        default=200 * 1024 * 1024, description="提交前文件大小上限 (MinerU 200MB)"
+    )
+
     # ==================== RAG 基础 ====================
     # Parent-Child 切分: rag_chunk_size 是 child 块大小 (embedding 用, 小=召回准);
     # rag_parent_max_chars 是 parent 块上限 (拼 LLM context 用, 大=上下文全)。

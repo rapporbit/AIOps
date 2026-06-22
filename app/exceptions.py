@@ -114,6 +114,14 @@ class MCPConnectionError(ServiceError):
     message = "MCP 服务不可用"
 
 
+class DocumentParseError(ServiceError):
+    """文档解析错误 (MinerU). 无 fallback: 失败即拒收, 稍后重试."""
+
+    status_code = 503
+    code = "DOCUMENT_PARSE_ERROR"
+    message = "文档解析服务不可用, 请稍后重试"
+
+
 class AgentExecutionError(ServiceError):
     """Agent 执行错误."""
 
