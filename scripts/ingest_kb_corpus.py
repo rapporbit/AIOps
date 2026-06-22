@@ -1,25 +1,26 @@
-"""批量入库脚本: docs/ + data/kb_corpus/ -> Milvus.
+"""批量入库脚本: docs/ + data/kb_corpus/ -> pgvector.
 
 用途:
   - 把 docs/ 下的 OnCall SOP 和 data/kb_corpus/ 下的开源告警语料
-    切分 -> embedding -> 写入 Milvus
-  - 走和线上 RAG 一致的链路: split_markdown() + get_vector_store().add_documents()
+    切分 -> embedding -> 写入 pgvector (复用应用的 Postgres)
+  - 走和线上 RAG 一致的链路: split_markdown() + pg_vector_store.add_documents()
   - 失败的文件单独记录, 不影响其他文件入库
 
 用法:
   python scripts/ingest_kb_corpus.py             # 入库
   python scripts/ingest_kb_corpus.py --dry-run   # 只切分不入库, 看会有多少 chunks
-  python scripts/ingest_kb_corpus.py --reset     # 先 drop 老 collection 再入库
+  python scripts/ingest_kb_corpus.py --reset     # 先清空 kb_chunks 表再入库
   python scripts/ingest_kb_corpus.py --limit 50  # 只入前 50 个文件 (调试用)
 
 前置条件:
-  - Milvus 已启动 (docker-compose up -d)
-  - DASHSCOPE_API_KEY 已配置
+  - Postgres 已启动且装了 pgvector 扩展 (docker compose up -d, 镜像 pgvector/pgvector:pg16)
+  - DASHSCOPE_API_KEY 已配置 (或用本地 ollama embedding)
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import json
 import sys
@@ -134,11 +135,13 @@ def _clear_checkpoint() -> None:
         CHECKPOINT_PATH.unlink()
 
 
-def ingest_to_milvus(chunks: List[Document], batch_size: int = 100, resume: bool = False) -> None:
-    """分批写入 Milvus."""
-    from app.core.vector_store import get_vector_store
+async def ingest_to_pgvector(chunks: List[Document], batch_size: int = 100, resume: bool = False) -> None:
+    """分批写入 pgvector."""
+    from app.core import pg_vector_store
 
-    vs = get_vector_store()
+    # 确保表/索引存在 (与应用 lifespan 同一套 DDL)
+    await pg_vector_store.init_vector_schema()
+
     total = len(chunks)
     dataset_hash = _chunks_fingerprint(chunks)
     start_index = _load_checkpoint(dataset_hash, batch_size) if resume else 0
@@ -157,7 +160,7 @@ def ingest_to_milvus(chunks: List[Document], batch_size: int = 100, resume: bool
         batch = chunks[i : i + batch_size]
         for attempt in range(1, max_retries + 2):
             try:
-                vs.add_documents(batch)
+                await pg_vector_store.add_documents(batch)
                 written += len(batch)
                 _save_checkpoint(dataset_hash, batch_size, i + len(batch), total)
                 consecutive_failures = 0
@@ -172,12 +175,10 @@ def ingest_to_milvus(chunks: List[Document], batch_size: int = 100, resume: bool
             except Exception as e:
                 if attempt <= max_retries:
                     logger.warning(
-                        f"  batch [{i}:{i+len(batch)}] 第 {attempt} 次失败, "
-                        f"重连后重试: {type(e).__name__}: {e}"
+                        f"  batch [{i}:{i+len(batch)}] 第 {attempt} 次失败, 重试: "
+                        f"{type(e).__name__}: {e}"
                     )
-                    get_vector_store.cache_clear()
-                    time.sleep(min(5, attempt * 2))
-                    vs = get_vector_store()
+                    await asyncio.sleep(min(5, attempt * 2))
                     continue
 
                 failed_batches += 1
@@ -185,8 +186,9 @@ def ingest_to_milvus(chunks: List[Document], batch_size: int = 100, resume: bool
                 logger.error(f"  batch [{i}:{i+len(batch)}] 失败: {type(e).__name__}: {e}")
                 if consecutive_failures >= 3:
                     raise RuntimeError(
-                        "Milvus 连续 3 个 batch 写入失败, 已停止入库. "
-                        "请先检查 docker compose ps standalone / docker logs multi-agent-milvus."
+                        "pgvector 连续 3 个 batch 写入失败, 已停止入库. "
+                        "请先检查 docker compose ps postgres / docker logs multi-agent-postgres, "
+                        "并确认 pgvector 扩展已安装。"
                     ) from e
 
     elapsed = time.perf_counter() - t0
@@ -198,35 +200,29 @@ def ingest_to_milvus(chunks: List[Document], batch_size: int = 100, resume: bool
         _clear_checkpoint()
 
 
-def reset_collection() -> None:
-    """drop 旧的 collection (慎用)."""
-    from pymilvus import MilvusClient
-
+async def reset_collection() -> None:
+    """清空 kb_chunks 表 (慎用)."""
     from app.config import settings
+    from app.core import pg_vector_store
+    from app.db.postgres import get_pool
 
-    uri = f"http://{settings.milvus_host}:{settings.milvus_port}"
-    client = MilvusClient(uri=uri)
-    if client.has_collection(settings.milvus_collection):
-        client.drop_collection(settings.milvus_collection)
-        logger.info(f"已 drop collection: {settings.milvus_collection}")
-    else:
-        logger.info(f"collection 不存在, 跳过 drop: {settings.milvus_collection}")
-    # 清掉单例缓存, 让下次 get_vector_store 重建
-    from app.core.vector_store import get_vector_store
-
-    get_vector_store.cache_clear()
+    await pg_vector_store.init_vector_schema()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(f"TRUNCATE TABLE {settings.pgvector_table}")
+    logger.info(f"已清空表: {settings.pgvector_table}")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="批量入库 docs/ + kb_corpus/ -> Milvus")
+    parser = argparse.ArgumentParser(description="批量入库 docs/ + kb_corpus/ -> pgvector")
     parser.add_argument("--dry-run", action="store_true", help="只切分不入库")
-    parser.add_argument("--reset", action="store_true", help="先 drop 老 collection")
+    parser.add_argument("--reset", action="store_true", help="先清空 kb_chunks 表")
     parser.add_argument("--resume", action="store_true", help="从上次成功 batch 的 checkpoint 续跑")
     parser.add_argument("--limit", type=int, default=0, help="只入前 N 个文件 (0=全部)")
     parser.add_argument("--batch", type=int, default=100, help="每批入库 chunk 数")
     args = parser.parse_args()
 
-    # 加载 .env (拿 DASHSCOPE_API_KEY / MILVUS_HOST 等)
+    # 加载 .env (拿 DASHSCOPE_API_KEY / DATABASE_URL 等)
     try:
         from dotenv import load_dotenv
 
@@ -264,11 +260,16 @@ def main() -> None:
         logger.error("--reset 和 --resume 不能同时使用: reset 会删除旧 collection, resume 需要保留旧数据")
         sys.exit(1)
 
-    if args.reset:
-        _clear_checkpoint()
-        reset_collection()
+    async def _run() -> None:
+        if args.reset:
+            _clear_checkpoint()
+            await reset_collection()
+        await ingest_to_pgvector(chunks, batch_size=args.batch, resume=args.resume)
+        from app.db.postgres import close_postgres
 
-    ingest_to_milvus(chunks, batch_size=args.batch, resume=args.resume)
+        await close_postgres()
+
+    asyncio.run(_run())
 
 
 if __name__ == "__main__":

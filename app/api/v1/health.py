@@ -15,8 +15,8 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
 from app.config import settings
+from app.core import pg_vector_store
 from app.core.mcp_client import mcp_client_manager
-from app.core.milvus import milvus_manager
 from app.db.postgres import postgres_health
 from app.queue.redis_streams import incident_queue
 from app.schemas.common import ApiResponse
@@ -43,20 +43,20 @@ async def liveness() -> ApiResponse[Dict[str, str]]:
 @router.get(
     "/ready",
     summary="就绪检查 (readiness)",
-    description="检查 Milvus (必需) / MCP (可选) 等依赖是否就绪",
+    description="检查 Postgres/pgvector (必需) / MCP (可选) 等依赖是否就绪",
 )
 async def readiness() -> Any:
     """
     Readiness 语义:
-      - milvus: 必需依赖, down 则返回 503
-      - postgres/redis: Incident Pipeline 开启时为必需依赖
+      - postgres: 必需依赖 (事故台账 + pgvector 知识库都在这), down 则返回 503
+      - vector_store(pgvector): 必需依赖, kb_chunks 表不可达则返回 503
+      - redis: Incident Pipeline 开启时为必需依赖
       - mcp:    可选依赖, 不影响 ready 状态
     """
-    milvus_alive = milvus_manager.is_alive()
-    postgres_alive = True
+    postgres_alive = await postgres_health()
+    vector_ready = await pg_vector_store.is_ready()
     redis_alive = True
     if settings.incident_pipeline_enabled:
-        postgres_alive = await postgres_health()
         try:
             redis_client = await incident_queue.client()
             redis_alive = bool(await redis_client.ping())
@@ -64,19 +64,19 @@ async def readiness() -> Any:
             redis_alive = False
     mcp_connected = mcp_client_manager.is_connected
     mcp_tools_count = len(mcp_client_manager.tools)
-    required_alive = milvus_alive and postgres_alive and redis_alive
+    required_alive = postgres_alive and vector_ready and redis_alive
 
     payload: Dict[str, Any] = {
         "status": "ready" if required_alive else "not_ready",
         "dependencies": {
-            "milvus": {
+            "vector_store": {
                 "required": True,
-                "status": "ok" if milvus_alive else "down",
-                "host": f"{settings.milvus_host}:{settings.milvus_port}",
-                "collection": settings.milvus_collection,
+                "status": "ok" if vector_ready else "down",
+                "backend": "pgvector",
+                "table": settings.pgvector_table,
             },
             "postgres": {
-                "required": settings.incident_pipeline_enabled,
+                "required": True,
                 "status": "ok" if postgres_alive else "down",
             },
             "redis_incident_queue": {

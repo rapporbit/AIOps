@@ -26,8 +26,9 @@ langgraph>=1.0.0,<2.0.0
 langgraph-checkpoint>=3.0.0
 
 # ---------- 向量数据库 ----------
-pymilvus>=2.4.0
-langchain-milvus>=0.3.3,<0.4.0
+# 已从 Milvus 迁到 pgvector: 复用下方 asyncpg 连到的同一个 Postgres 实例,
+# 向量类型/HNSW 索引由服务端 pgvector 扩展提供 (镜像 pgvector/pgvector:pg16),
+# Python 侧无需额外包 (向量以 ::vector 文本字面量传参, 见 app/core/pg_vector_store.py)。
 
 # ---------- RAG Hybrid Search ----------
 # rank_bm25: 纯 Python BM25 实现 (~10KB), 用于 Hybrid Search 的 sparse 路.

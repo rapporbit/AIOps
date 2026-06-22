@@ -1,94 +1,15 @@
 # ============================================================
 # Multi-Agent AIOps Platform - Docker Compose
 # ============================================================
-# 启动 Milvus 向量数据库 (含 etcd + minio + standalone + attu UI)
+# 向量库已从 Milvus 迁到 pgvector: 不再需要 etcd/minio/standalone/attu,
+# 向量直接落在下面的 postgres (pgvector 镜像) 里, 与事故台账同库。
 #
 # 使用:
-#   docker compose up -d        # 启动
+#   docker compose up -d        # 启动基础设施 (postgres/redis/...)
 #   docker compose down         # 停止
 #   docker compose logs -f      # 看日志
-#
-# 端口:
-#   - 19530: Milvus gRPC
-#   - 9091:  Milvus REST
-#   - 9001:  MinIO 控制台 (root/Milvus)
-#   - 8000:  Attu Milvus 可视化界面
-#
-# 注意: 如果你已经有其他 Milvus 实例在跑 (如 super_biz_agent_py),
-#       请先停掉再启动本项目, 避免端口冲突.
 
 services:
-  etcd:
-    container_name: multi-agent-etcd
-    image: quay.io/coreos/etcd:v3.5.5
-    environment:
-      - ETCD_AUTO_COMPACTION_MODE=revision
-      - ETCD_AUTO_COMPACTION_RETENTION=1000
-      - ETCD_QUOTA_BACKEND_BYTES=4294967296
-      - ETCD_SNAPSHOT_COUNT=50000
-    volumes:
-      - multi_agent_etcd:/etcd
-    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
-    healthcheck:
-      test: ["CMD", "etcdctl", "endpoint", "health"]
-      interval: 30s
-      timeout: 20s
-      retries: 3
-    restart: unless-stopped
-
-  minio:
-    container_name: multi-agent-minio
-    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
-    environment:
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
-    ports:
-      - "9001:9001"
-    volumes:
-      - multi_agent_minio:/minio_data
-    command: minio server /minio_data --console-address ":9001"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 30s
-      timeout: 20s
-      retries: 3
-    restart: unless-stopped
-
-  standalone:
-    container_name: multi-agent-milvus
-    image: milvusdb/milvus:v2.4.10
-    command: ["milvus", "run", "standalone"]
-    security_opt:
-      - seccomp:unconfined
-    environment:
-      ETCD_ENDPOINTS: etcd:2379
-      MINIO_ADDRESS: minio:9000
-    volumes:
-      - multi_agent_milvus:/var/lib/milvus
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
-      interval: 30s
-      start_period: 90s
-      timeout: 20s
-      retries: 3
-    ports:
-      - "19530:19530"
-      - "9091:9091"
-    depends_on:
-      - "etcd"
-      - "minio"
-    restart: unless-stopped
-
-  attu:
-    container_name: multi-agent-attu
-    image: zilliz/attu:v2.4
-    environment:
-      MILVUS_URL: standalone:19530
-    ports:
-      - "8000:3000"
-    depends_on:
-      - "standalone"
-
   redis:
     container_name: multi-agent-redis
     image: redis:7-alpine
@@ -102,11 +23,12 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-    restart: unless-stopped
 
   postgres:
     container_name: multi-agent-postgres
-    image: postgres:16-alpine
+    # pgvector 官方镜像 (postgres 16 + vector 扩展), 替代原 postgres:16-alpine,
+    # 否则 CREATE EXTENSION vector 会失败。
+    image: pgvector/pgvector:pg16
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-multi_agent_aiops}
       POSTGRES_USER: ${POSTGRES_USER:-multi_agent}
@@ -120,7 +42,6 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-    restart: unless-stopped
 
   open-websearch:
     container_name: multi-agent-open-websearch
@@ -161,7 +82,6 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
-    restart: unless-stopped
 
   mcp-websearch:
     container_name: multi-agent-mcp-websearch
@@ -183,7 +103,6 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
-    restart: unless-stopped
 
   mcp-winlog:
     container_name: multi-agent-mcp-winlog
@@ -200,7 +119,6 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
-    restart: unless-stopped
 
   mcp-network:
     container_name: multi-agent-mcp-network
@@ -217,7 +135,6 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
-    restart: unless-stopped
 
   mcp-docker:
     container_name: multi-agent-mcp-docker
@@ -234,7 +151,6 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
-    restart: unless-stopped
 
   api:
     container_name: multi-agent-api
@@ -247,7 +163,6 @@ services:
       # 容器内用服务名互联, 覆盖 .env 里的 localhost
       DATABASE_URL: postgresql://${POSTGRES_USER:-multi_agent}:${POSTGRES_PASSWORD:-multi_agent}@postgres:5432/${POSTGRES_DB:-multi_agent_aiops}
       REDIS_URL: redis://redis:6379/0
-      MILVUS_HOST: standalone
       OLLAMA_BASE_URL: http://host.docker.internal:11434
       LOCAL_LLM_BASE_URL: http://host.docker.internal:11434/v1
       OPEN_WEBSEARCH_BASE_URL: http://open-websearch:3210
@@ -267,8 +182,6 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
-      standalone:
-        condition: service_healthy
       mcp-system:
         condition: service_healthy
       mcp-websearch:
@@ -279,7 +192,6 @@ services:
         condition: service_healthy
       mcp-docker:
         condition: service_healthy
-    restart: unless-stopped
 
   worker-1:
     container_name: multi-agent-worker-1
@@ -291,7 +203,6 @@ services:
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-multi_agent}:${POSTGRES_PASSWORD:-multi_agent}@postgres:5432/${POSTGRES_DB:-multi_agent_aiops}
       REDIS_URL: redis://redis:6379/0
-      MILVUS_HOST: standalone
       OLLAMA_BASE_URL: http://host.docker.internal:11434
       LOCAL_LLM_BASE_URL: http://host.docker.internal:11434/v1
       OPEN_WEBSEARCH_BASE_URL: http://open-websearch:3210
@@ -318,7 +229,6 @@ services:
         condition: service_healthy
       mcp-docker:
         condition: service_healthy
-    restart: unless-stopped
 
   worker-2:
     container_name: multi-agent-worker-2
@@ -330,7 +240,6 @@ services:
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-multi_agent}:${POSTGRES_PASSWORD:-multi_agent}@postgres:5432/${POSTGRES_DB:-multi_agent_aiops}
       REDIS_URL: redis://redis:6379/0
-      MILVUS_HOST: standalone
       OLLAMA_BASE_URL: http://host.docker.internal:11434
       LOCAL_LLM_BASE_URL: http://host.docker.internal:11434/v1
       OPEN_WEBSEARCH_BASE_URL: http://open-websearch:3210
@@ -357,7 +266,6 @@ services:
         condition: service_healthy
       mcp-docker:
         condition: service_healthy
-    restart: unless-stopped
 
   worker-3:
     container_name: multi-agent-worker-3
@@ -369,7 +277,6 @@ services:
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-multi_agent}:${POSTGRES_PASSWORD:-multi_agent}@postgres:5432/${POSTGRES_DB:-multi_agent_aiops}
       REDIS_URL: redis://redis:6379/0
-      MILVUS_HOST: standalone
       OLLAMA_BASE_URL: http://host.docker.internal:11434
       LOCAL_LLM_BASE_URL: http://host.docker.internal:11434/v1
       OPEN_WEBSEARCH_BASE_URL: http://open-websearch:3210
@@ -396,15 +303,11 @@ services:
         condition: service_healthy
       mcp-docker:
         condition: service_healthy
-    restart: unless-stopped
 
 networks:
   default:
     name: multi_agent_network
 
 volumes:
-  multi_agent_etcd:
-  multi_agent_minio:
-  multi_agent_milvus:
   multi_agent_redis:
   multi_agent_postgres:

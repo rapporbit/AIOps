@@ -1,20 +1,19 @@
 """文档管理服务: 上传 / 列表 / 删除.
 
 设计要点:
-  - 上传: 读文件 → 分块 (core/splitter) → 写入 Milvus (langchain_milvus)
-  - 列表: 通过 collection.query 拉取所有 metadata, 按 source 字段聚合
-  - 删除: 用 expr 表达式按 source 字段过滤删除
+  - 上传: 读文件 → 分块 (core/splitter) → 写入 pgvector (core/pg_vector_store)
+  - 列表: 按 source 字段聚合 chunk 数
+  - 删除: 按 source 字段删除所有相关 chunk
 """
 
-from typing import Dict, List
+from typing import List
 
 from fastapi import UploadFile
 from loguru import logger
 
 from app.config import settings
-from app.core.milvus import milvus_manager
+from app.core import pg_vector_store
 from app.core.splitter import split_markdown
-from app.core.vector_store import get_vector_store
 from app.exceptions import (
     UnsupportedFileTypeError,
     VectorStoreError,
@@ -56,8 +55,7 @@ async def upload_document(file: UploadFile) -> UploadResponse:
 
     # 写入向量库
     try:
-        vs = get_vector_store()
-        vs.add_documents(chunks)
+        await pg_vector_store.add_documents(chunks)
     except Exception as e:
         logger.exception(f"[document] 写入向量库失败: {e}")
         raise VectorStoreError(f"向量库写入失败: {e}") from e
@@ -70,7 +68,7 @@ async def upload_document(file: UploadFile) -> UploadResponse:
         try:
             from app.core.hybrid_retriever import refresh_bm25_index
 
-            refresh_bm25_index()
+            await refresh_bm25_index()
         except Exception as e:
             logger.warning(f"[document] BM25 刷新失败 (忽略): {type(e).__name__}: {e}")
 
@@ -84,88 +82,42 @@ async def upload_document(file: UploadFile) -> UploadResponse:
 # ============================================================
 # 列表
 # ============================================================
-def list_documents() -> List[DocumentInfo]:
+async def list_documents() -> List[DocumentInfo]:
     """列出所有已索引的文档 (按 source 聚合)."""
-    if not milvus_manager.has_collection():
-        return []
-
-    try:
-        from pymilvus import Collection
-
-        col = Collection(settings.milvus_collection)
-        col.load()
-
-        # 查所有记录的 source 字段 (langchain_milvus 把 metadata 存为 JSON 字段)
-        # 对于较大的 collection 这会很慢, 生产环境应该用单独的元数据表
-        results = col.query(
-            expr="pk >= 0",  # 全表
-            output_fields=["source"],  # 只要 source
-            limit=16384,  # Milvus 单次 query 上限
-        )
-
-    except Exception as e:
-        logger.warning(f"[document] 查询文档列表失败: {e}")
-        return []
-
-    # 聚合
-    counter: Dict[str, int] = {}
-    for row in results:
-        source = row.get("source") or "unknown"
-        counter[source] = counter.get(source, 0) + 1
-
-    return sorted(
-        [DocumentInfo(source=k, chunk_count=v) for k, v in counter.items()],
-        key=lambda d: d.source,
-    )
+    sources = await pg_vector_store.list_sources()
+    return [DocumentInfo(source=src, chunk_count=cnt) for src, cnt in sources]
 
 
 # ============================================================
 # 删除
 # ============================================================
-def delete_document(source: str) -> int:
+async def delete_document(source: str) -> int:
     """按 source 删除所有相关 chunks.
 
     Returns:
         删除的 chunk 数量
     """
-    if not milvus_manager.has_collection():
-        return 0
-
     try:
-        from pymilvus import Collection
-
-        col = Collection(settings.milvus_collection)
-
-        # 先 query 看有多少
-        rows = col.query(
-            expr=f'source == "{source}"',
-            output_fields=["pk"],
-            limit=16384,
-        )
-        if not rows:
-            return 0
-
-        # 用 pk 列表删除 (比 expr 删除更精确)
-        pks = [r["pk"] for r in rows]
-        col.delete(expr=f"pk in {pks}")
-        col.flush()
-
-        logger.info(f"[document] 删除 {source}: {len(pks)} 个 chunk")
-
-        # 同步刷新 BM25 索引 (避免删除后 BM25 仍能命中已删文档)
-        if settings.rag_hybrid_enabled and settings.rag_bm25_refresh_on_upload:
-            try:
-                from app.core.hybrid_retriever import refresh_bm25_index
-
-                refresh_bm25_index()
-            except Exception as e:
-                logger.warning(f"[document] BM25 刷新失败 (忽略): {type(e).__name__}: {e}")
-
-        return len(pks)
-
+        deleted = await pg_vector_store.delete_by_source(source)
     except Exception as e:
         logger.exception(f"[document] 删除失败: {e}")
         raise VectorStoreError(f"删除失败: {e}") from e
+
+    if deleted == 0:
+        return 0
+
+    logger.info(f"[document] 删除 {source}: {deleted} 个 chunk")
+
+    # 同步刷新 BM25 索引 (避免删除后 BM25 仍能命中已删文档)
+    if settings.rag_hybrid_enabled and settings.rag_bm25_refresh_on_upload:
+        try:
+            from app.core.hybrid_retriever import refresh_bm25_index
+
+            await refresh_bm25_index()
+        except Exception as e:
+            logger.warning(f"[document] BM25 刷新失败 (忽略): {type(e).__name__}: {e}")
+
+    return deleted
 
 
 # ============================================================

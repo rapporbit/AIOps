@@ -29,10 +29,10 @@ Hybrid 策略: 让 BM25 (sparse) 和 Vector (dense) 各出候选, 再用 RRF 融
 
 索引刷新
 ======================
-  - BM25 索引是**纯内存**, 进程启动时从 Milvus 拉全量 chunks 构建
+  - BM25 索引是**纯内存**, 首次检索时从 pgvector 拉全量 chunks 构建
   - 文档上传/删除后, 调 refresh() 重建 (小规模毫秒级)
   - 局限: 多副本部署时每个副本都要各自构建; 大规模 (10 万 chunks+) 建议改为
-    Elasticsearch / OpenSearch 托管索引
+    Postgres 全文检索 (tsvector) 或 Elasticsearch / OpenSearch 托管索引
 """
 
 from __future__ import annotations
@@ -89,7 +89,7 @@ class _BM25Index:
     """BM25 索引 (线程安全单例, 惰性构建).
 
     构建时机:
-      - 第一次检索时 (lazy): 从 Milvus 拉全量 chunks 构建
+      - 第一次检索时 (lazy): 从 pgvector 拉全量 chunks 构建
       - 文档上传/删除后: document_service 调 refresh() 主动刷新
     """
 
@@ -103,7 +103,7 @@ class _BM25Index:
         """用给定文档构建 BM25.
 
         Args:
-            docs: 所有候选文档 (通常来自 Milvus 全量拉取)
+            docs: 所有候选文档 (通常来自 pgvector 全量拉取)
         """
         if BM25Okapi is None:
             self._built = True  # 标记已尝试, 避免反复重建
@@ -169,12 +169,12 @@ _bm25_index = _BM25Index()
 # ---------------------------------------------------------------------------
 # 对外接口
 # ---------------------------------------------------------------------------
-def refresh_bm25_index() -> None:
-    """重建 BM25 索引 (从 Milvus 拉全量 chunks).
+async def refresh_bm25_index() -> None:
+    """重建 BM25 索引 (从 pgvector 拉全量 chunks).
 
     调用时机:
-      - 应用启动 lifespan (可选, 否则首次检索时 lazy 构建)
       - document_service 上传 / 删除后 (如果 rag_bm25_refresh_on_upload=True)
+      - 首次检索时 lazy 构建 (advanced_search)
 
     失败兜底: 拉不到数据时保持上一份索引 (若有), 不阻断业务.
     """
@@ -182,60 +182,10 @@ def refresh_bm25_index() -> None:
         logger.warning("[hybrid] rank_bm25 未安装, 跳过 refresh")
         return
 
-    docs = _load_all_chunks_from_milvus()
+    from app.core import pg_vector_store
+
+    docs = await pg_vector_store.load_all_chunks()
     _bm25_index.build(docs)
-
-
-def _load_all_chunks_from_milvus() -> List[Document]:
-    """从 Milvus 拉全量 chunks (用于构建 BM25 索引).
-
-    局限: 用 col.query(expr="pk >= 0", limit=16384). 超过 16k chunks 需分页.
-    这里为 demo 简化, 生产环境建议维护独立元数据表.
-    """
-    try:
-        from pymilvus import Collection, MilvusClient, connections
-
-        uri = f"http://{settings.milvus_host}:{settings.milvus_port}"
-        client = MilvusClient(uri=uri)
-        if not client.has_collection(settings.milvus_collection):
-            return []
-
-        alias = client._using
-        if alias not in [c[0] for c in connections.list_connections()]:
-            connections.connect(alias=alias, uri=uri)
-
-        col = Collection(settings.milvus_collection, using=alias)
-        col.load()
-        rows = col.query(
-            expr="pk >= 0",
-            output_fields=[
-                "content",
-                "source",
-                "chapter",
-                "parent_id",
-                "parent_content",
-                "chunk_index",
-            ],
-            limit=16384,
-        )
-    except Exception as e:
-        logger.warning(f"[hybrid] 从 Milvus 拉全量失败 (降级): {type(e).__name__}: {e}")
-        return []
-
-    docs: List[Document] = []
-    for row in rows:
-        content = row.get("content") or ""
-        if not content:
-            continue
-        meta = {
-            "source": row.get("source") or "未知",
-            "chapter": row.get("chapter") or "",
-            "parent_id": row.get("parent_id") or "",
-            "parent_content": row.get("parent_content") or "",
-            "chunk_index": row.get("chunk_index"),
-        }
-        docs.append(Document(page_content=content, metadata=meta))
-    return docs
 
 
 def hybrid_search(

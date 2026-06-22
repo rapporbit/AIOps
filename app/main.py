@@ -8,7 +8,7 @@
   5. 注册全局异常处理器
   6. 注册路由
   7. 挂载静态文件 (前端)
-  8. lifespan 钩子 (启动时连 Milvus, 关闭时断开)
+  8. lifespan 钩子 (启动时连 Postgres + 初始化 pgvector, 关闭时断开)
 
 启动方式:
   开发: uvicorn app.main:app --reload
@@ -28,8 +28,8 @@ from loguru import logger
 from app.api.middleware import setup_middlewares
 from app.api.v1 import aiops, chat, documents, eval as eval_api, health, incidents, queue, skills, webhook, wiki, approvals
 from app.config import settings
+from app.core import pg_vector_store
 from app.core.mcp_client import mcp_client_manager
-from app.core.milvus import milvus_manager
 from app.db.postgres import close_postgres, connect_postgres, init_incident_schema
 from app.exceptions import AppException
 from app.logging_config import setup_logging
@@ -56,12 +56,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # 1. 校验配置 (无效时直接抛错, 让 uvicorn 退出)
     settings.validate_runtime()
 
-    # 2. 连接 Milvus (必需依赖, 失败则启动失败)
-    milvus_manager.connect()
+    # 2. 连接 Postgres + 初始化向量库 (必需依赖: KB/RAG 现以 pgvector 落在 PG 内,
+    #    与 Incident Pipeline 是否开启无关, 失败则启动失败)
+    await connect_postgres()
+    await pg_vector_store.init_vector_schema()
 
-    # 3. 初始化 Incident Pipeline (Postgres 事实库 + Redis Stream 队列)
+    # 3. 初始化 Incident Pipeline (事故台账 schema + Redis Stream 队列)
     if settings.incident_pipeline_enabled:
-        await connect_postgres()
         await init_incident_schema()
         await incident_queue.connect()
 
@@ -75,8 +76,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await mcp_client_manager.close()
     if settings.incident_pipeline_enabled:
         await incident_queue.close()
-        await close_postgres()
-    milvus_manager.disconnect()
+    await close_postgres()
     logger.info("应用已关闭")
 
 

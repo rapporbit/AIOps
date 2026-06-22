@@ -82,16 +82,19 @@ class Settings(BaseSettings):
         description="Ollama embedding HTTP 调用超时秒数",
     )
 
-    # ==================== Milvus 向量数据库 ====================
-    milvus_host: str = Field(default="localhost", description="Milvus 主机")
-    milvus_port: int = Field(default=19530, description="Milvus 端口")
-    milvus_collection: str = Field(default="multi_agent_kb", description="Collection 名")
-    milvus_timeout_ms: int = Field(default=10000, description="连接超时 (毫秒)")
-    milvus_hnsw_search_ef: int = Field(
+    # ==================== pgvector 向量数据库 ====================
+    # 向量库已从 Milvus 迁到 pgvector, 复用下方 database_url 的同一个 Postgres 实例,
+    # 表为 kb_chunks (见 app/core/pg_vector_store.py)。维度由 embedding 模型决定 (默认 1024)。
+    pgvector_table: str = Field(default="kb_chunks", description="向量库表名")
+    pgvector_hnsw_m: int = Field(default=16, description="HNSW 图每层最大连接数 (建索引时)")
+    pgvector_hnsw_ef_construction: int = Field(
+        default=64, description="HNSW 建索引时的候选数, 越大索引越准越慢"
+    )
+    pgvector_hnsw_ef_search: int = Field(
         default=128,
         description=(
-            "HNSW 查询时 ef 参数, 必须大于等于实际搜索 top-k. "
-            "只影响查询召回/延迟, 不需要重建索引."
+            "HNSW 查询时 ef_search, 必须 >= 实际 top-k. "
+            "只影响查询召回/延迟, 不需要重建索引 (每查询用 SET LOCAL 生效)."
         ),
     )
 
@@ -179,8 +182,12 @@ class Settings(BaseSettings):
         description="Worker heartbeat key 的 TTL 秒数, 过期表示该 Worker 可能已经退出.",
     )
     diagnosis_task_timeout_sec: int = Field(
-        default=600,
-        description="单个诊断任务最大运行秒数. 超时后进入 retry 或 DLQ, 避免任务永久占用 Worker.",
+        default=1800,
+        description=(
+            "单个诊断任务的墙钟超时秒数 (含等人工审批的时间). 必须 > 单次工作耗时 + 审批耗时 "
+            "(approvals_timeout_sec), 否则等审批时会被腰斩; 默认 30 分钟. "
+            "超时后进入 retry 或 DLQ, 避免任务永久占用 Worker."
+        ),
     )
     diagnosis_task_max_attempts: int = Field(
         default=3,
