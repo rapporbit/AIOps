@@ -34,6 +34,8 @@ services:
     # pg_search 必须进 shared_preload_libraries。ParadeDB 镜像只在"全新 initdb"时
     # 自动写入; 复用旧 PG16 数据卷时其 conf 没有, 故用命令行 -c 显式注入 (覆盖 conf,
     # 对新卷/旧卷都成立)。vector(pgvector) 不需要 preload。
+    # 注意: -c 是"替换"而非"追加"。若将来换的 ParadeDB 镜像默认还预加载了别的库
+    # (如 pg_cron/pg_analytics) 且依赖它, 升级镜像时需把那些库一并列进这里。
     command: ["postgres", "-c", "shared_preload_libraries=pg_search"]
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-multi_agent_aiops}
