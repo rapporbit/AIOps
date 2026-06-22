@@ -26,7 +26,7 @@ from fastapi.staticfiles import StaticFiles
 from loguru import logger
 
 from app.api.middleware import setup_middlewares
-from app.api.v1 import aiops, chat, documents, eval as eval_api, health, incidents, queue, skills, webhook, wiki, approvals
+from app.api.v1 import aiops, chat, documents, eval as eval_api, health, incidents, kb_sources, queue, skills, webhook, wiki, approvals
 from app.config import settings
 from app.core import pg_vector_store
 from app.core.kb_sync_schema import init_kb_sync_schema
@@ -158,6 +158,7 @@ app.include_router(health.router, prefix=API_PREFIX)
 app.include_router(chat.router, prefix=API_PREFIX)
 app.include_router(aiops.router, prefix=API_PREFIX)
 app.include_router(documents.router, prefix=API_PREFIX)
+app.include_router(kb_sources.router, prefix=API_PREFIX)
 app.include_router(incidents.router, prefix=API_PREFIX)
 app.include_router(skills.router, prefix=API_PREFIX)
 app.include_router(webhook.router, prefix=API_PREFIX)

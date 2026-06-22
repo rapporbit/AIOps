@@ -124,6 +124,19 @@ class Settings(BaseSettings):
         default=200 * 1024 * 1024, description="提交前文件大小上限 (MinerU 200MB)"
     )
 
+    # ==================== 飞书 (Lark) 数据源 ====================
+    # 企业自建应用: App ID + App Secret 换 tenant_access_token 访问云文档/知识库。
+    # ⚠️ 还需在飞书把应用加为目标 Wiki/文件夹的"文档应用/协作者", 否则列表为空。
+    feishu_app_id: str = Field(default="", description="飞书自建应用 App ID")
+    feishu_app_secret: str = Field(default="", description="飞书自建应用 App Secret (密钥)")
+    feishu_api_base: str = Field(
+        default="https://open.feishu.cn", description="飞书开放平台根地址"
+    )
+    feishu_timeout_sec: float = Field(default=30.0, description="飞书 API 调用超时秒")
+    feishu_export_timeout_sec: float = Field(
+        default=120.0, description="飞书文档导出 (export_task) 总超时秒"
+    )
+
     # ==================== RAG 基础 ====================
     # Parent-Child 切分: rag_chunk_size 是 child 块大小 (embedding 用, 小=召回准);
     # rag_parent_max_chars 是 parent 块上限 (拼 LLM context 用, 大=上下文全)。
