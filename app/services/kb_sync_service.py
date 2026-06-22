@@ -18,9 +18,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from loguru import logger
 
@@ -131,6 +132,41 @@ async def _finish_run(conn, run_id: int, status: str, stats: dict, error: str = 
 # ============================================================
 # 同步主流程
 # ============================================================
+# 持有后台同步任务的强引用, 防止被 GC (asyncio 只持弱引用)。
+_bg_tasks: Set[asyncio.Task] = set()
+
+
+def launch_sync(source: KbSource) -> bool:
+    """后台触发一次同步 (不阻塞调用方)。返回是否成功创建任务。
+
+    并发安全靠 sync_source 内的 advisory lock: 同源已在跑时新任务会立即返回 locked。
+    """
+    task = asyncio.create_task(sync_source(source))
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+    return True
+
+
+async def recent_runs(source_id: str, limit: int = 5) -> List[Dict[str, Any]]:
+    """最近的同步运行记录 (供后台触发后轮询状态)。"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, status, stats, error, started_at, finished_at "
+            "FROM kb_sync_run WHERE source_id=$1 ORDER BY id DESC LIMIT $2",
+            source_id, int(limit),
+        )
+    out = []
+    for r in rows:
+        d = dict(r)
+        if isinstance(d.get("stats"), str):
+            d["stats"] = json.loads(d["stats"] or "{}")
+        d["started_at"] = d["started_at"].isoformat() if d.get("started_at") else None
+        d["finished_at"] = d["finished_at"].isoformat() if d.get("finished_at") else None
+        out.append(d)
+    return out
+
+
 async def sync_source(source: KbSource) -> Dict[str, Any]:
     """同步单个数据源, 返回统计。advisory lock 保证同源串行。"""
     connector = _connector_for(source)

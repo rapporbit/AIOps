@@ -60,7 +60,8 @@ class MinerUParser:
             )
 
         deadline = time.monotonic() + settings.mineru_timeout_sec
-        timeout = httpx.Timeout(60.0)
+        # 分别设超时: 文件最大 200MB, PUT 上传/zip 下载需要较长 write/read; 轮询 GET 很快。
+        timeout = httpx.Timeout(connect=30.0, read=180.0, write=300.0, pool=30.0)
         async with httpx.AsyncClient(timeout=timeout) as client:
             batch_id = await self._submit(client, blob, filename, need_ocr)
             zip_url = await self._poll(client, batch_id, filename, deadline)

@@ -60,16 +60,35 @@ async def list_sources() -> ApiResponse:
 @router.post(
     "/sources/{source_id}/sync",
     response_model=ApiResponse,
-    summary="触发一次同步 (同步执行)",
-    description="拉取数据源 → 解析 → 增量写入 pgvector。本期同步内联执行, 返回统计。",
+    summary="触发一次同步",
+    description=(
+        "默认**后台执行**, 立即返回; 用 GET .../runs 轮询结果。"
+        "传 `?wait=true` 则内联执行并返回统计 (适合脚本/小库自检)。"
+    ),
     dependencies=[Depends(require_kb_admin_token)],
 )
-async def sync_source(source_id: str) -> ApiResponse:
+async def sync_source(source_id: str, wait: bool = False) -> ApiResponse:
     source = await kb_source_service.get_source(source_id)
     if not source:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="数据源不存在")
-    stats = await kb_sync_service.sync_source(source)
-    return ApiResponse.success(data=stats, message="同步完成")
+    if wait:
+        stats = await kb_sync_service.sync_source(source)
+        return ApiResponse.success(data=stats, message="同步完成")
+    kb_sync_service.launch_sync(source)
+    return ApiResponse.success(
+        data={"source_id": source_id, "started": True},
+        message="同步已在后台启动, 用 /sources/{id}/runs 查看进度",
+    )
+
+
+@router.get(
+    "/sources/{source_id}/runs",
+    response_model=ApiResponse,
+    summary="最近同步运行记录",
+)
+async def list_runs(source_id: str, limit: int = 5) -> ApiResponse:
+    runs = await kb_sync_service.recent_runs(source_id, limit=limit)
+    return ApiResponse.success(data={"runs": runs})
 
 
 @router.post(
