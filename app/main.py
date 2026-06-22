@@ -29,6 +29,7 @@ from app.api.middleware import setup_middlewares
 from app.api.v1 import aiops, chat, documents, eval as eval_api, health, incidents, queue, skills, webhook, wiki, approvals
 from app.config import settings
 from app.core import pg_vector_store
+from app.core.kb_sync_schema import init_kb_sync_schema
 from app.core.mcp_client import mcp_client_manager
 from app.db.postgres import close_postgres, connect_postgres, init_incident_schema
 from app.exceptions import AppException
@@ -60,6 +61,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     #    与 Incident Pipeline 是否开启无关, 失败则启动失败)
     await connect_postgres()
     await pg_vector_store.init_vector_schema()
+    await init_kb_sync_schema()
 
     # 3. 初始化 Incident Pipeline (事故台账 schema + Redis Stream 队列)
     if settings.incident_pipeline_enabled:

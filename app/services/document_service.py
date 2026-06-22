@@ -52,9 +52,11 @@ async def upload_document(file: UploadFile) -> UploadResponse:
     if not chunks:
         raise UnsupportedFileTypeError(f"文件 {filename} 切分后无有效内容")
 
-    # 写入向量库
+    # 写入向量库: 用 doc_id 幂等替换 (同名再传会先删旧 chunk, 不再重复堆积)。
+    # 本地直传的稳定 doc_id 约定 = 'local:'+文件名, 与建表时的存量回填一致。
+    doc_id = f"local:{filename}"
     try:
-        await pg_vector_store.add_documents(chunks)
+        await pg_vector_store.replace_doc(doc_id, chunks)
     except Exception as e:
         logger.exception(f"[document] 写入向量库失败: {e}")
         raise VectorStoreError(f"向量库写入失败: {e}") from e

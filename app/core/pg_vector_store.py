@@ -88,6 +88,7 @@ async def init_vector_schema() -> None:
                     content TEXT NOT NULL,
                     embedding vector({dim}) NOT NULL,
                     source TEXT NOT NULL DEFAULT '',
+                    doc_id TEXT NOT NULL DEFAULT '',
                     chapter TEXT NOT NULL DEFAULT '',
                     parent_id TEXT NOT NULL DEFAULT '',
                     parent_content TEXT NOT NULL DEFAULT '',
@@ -97,9 +98,24 @@ async def init_vector_schema() -> None:
                 )
                 """
             )
+            # doc_id 增量迁移: 老表 (迁移前已建) 没有这列, 补上 (幂等)。
+            # doc_id = 一篇文档的稳定主键, 删旧/幂等替换都按它 (多源同步的地基)。
+            await conn.execute(
+                f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS doc_id TEXT NOT NULL DEFAULT ''"
+            )
+            # 存量回填: 迁移前入库的本地文档 doc_id 为空, 用 'local:'+source 兜底,
+            # 让它们也有稳定 doc_id (只动 doc_id='' 的行, 再次启动是 0 行更新, 幂等)。
+            await conn.execute(
+                f"UPDATE {table} SET doc_id = 'local:' || source "
+                f"WHERE doc_id = '' AND source <> ''"
+            )
             # 按 source 删除/聚合用
             await conn.execute(
                 f"CREATE INDEX IF NOT EXISTS idx_{table}_source ON {table}(source)"
+            )
+            # 按 doc_id 删除/幂等替换用
+            await conn.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_{table}_doc_id ON {table}(doc_id)"
             )
             # 向量近邻索引: HNSW + cosine
             await conn.execute(
@@ -133,28 +149,44 @@ async def init_vector_schema() -> None:
     logger.info(f"[pgvector] schema ready: table={table}, dim={dim}, bm25={_bm25_tokenizer()}")
 
 
-async def add_documents(docs: List[Document]) -> int:
-    """向量化并写入 child chunks。返回写入条数。"""
-    if not docs:
-        return 0
+def _insert_sql(table: str) -> str:
+    return f"""
+        INSERT INTO {table}
+            (content, embedding, source, doc_id, chapter, parent_id,
+             parent_content, chunk_index, metadata)
+        VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8, $9::jsonb)
+        """
 
-    contents = [d.page_content for d in docs]
+
+async def _embed(contents: List[str]) -> List[List[float]]:
+    """同步 HTTP 的 embedding 丢到线程池, 不阻塞事件循环。数量不匹配则抛错。"""
     emb = get_embeddings()
-    # embed_documents 是同步 HTTP, 丢到线程池避免阻塞事件循环
     vectors = await asyncio.to_thread(emb.embed_documents, contents)
-    if len(vectors) != len(docs):
+    if len(vectors) != len(contents):
         raise RuntimeError(
-            f"embedding 数量不匹配: docs={len(docs)}, vectors={len(vectors)}"
+            f"embedding 数量不匹配: contents={len(contents)}, vectors={len(vectors)}"
         )
+    return vectors
 
+
+def _build_rows(
+    docs: List[Document],
+    vectors: List[List[float]],
+    *,
+    doc_id_override: Optional[str] = None,
+) -> List[tuple]:
+    """docs + 向量 → INSERT 行元组。doc_id_override 非空时强制覆盖每行 doc_id。"""
     rows = []
     for doc, vec in zip(docs, vectors):
-        meta = doc.metadata or {}
+        meta = dict(doc.metadata or {})
+        doc_id = doc_id_override if doc_id_override is not None else str(meta.get("doc_id") or "")
+        meta["doc_id"] = doc_id  # 同步写进 metadata, 保持 JSONB 与列一致
         rows.append(
             (
                 doc.page_content,
                 _vec_literal(vec),
                 str(meta.get("source") or ""),
+                doc_id,
                 str(meta.get("chapter") or ""),
                 str(meta.get("parent_id") or ""),
                 str(meta.get("parent_content") or ""),
@@ -162,19 +194,49 @@ async def add_documents(docs: List[Document]) -> int:
                 json.dumps(meta, ensure_ascii=False),
             )
         )
+    return rows
+
+
+async def add_documents(docs: List[Document]) -> int:
+    """向量化并写入 child chunks (追加, 不去重)。返回写入条数。
+
+    doc_id 取自每个 doc 的 metadata['doc_id'] (没有则为空串)。需要"按文档幂等替换"
+    请用 replace_doc。
+    """
+    if not docs:
+        return 0
+    vectors = await _embed([d.page_content for d in docs])
+    rows = _build_rows(docs, vectors)
 
     table = _table()
     pool = await get_pool()
     async with pool.acquire() as conn:
-        await conn.executemany(
-            f"""
-            INSERT INTO {table}
-                (content, embedding, source, chapter, parent_id,
-                 parent_content, chunk_index, metadata)
-            VALUES ($1, $2::vector, $3, $4, $5, $6, $7, $8::jsonb)
-            """,
-            rows,
-        )
+        await conn.executemany(_insert_sql(table), rows)
+    return len(rows)
+
+
+async def replace_doc(doc_id: str, docs: List[Document]) -> int:
+    """按 doc_id 幂等替换一篇文档的全部 chunk: 先删旧, 再插新。返回新写入条数。
+
+    原子性 (设计 C1): embedding 在事务**外**先算好 (这是最易失败的一步, 网络调用);
+    只有 DELETE + INSERT 放进同一事务, 任何一步失败整体回滚, 旧 chunk 不丢、不出现"删了没插上"的空窗。
+    BM25 (pg_search) 索引随这两步 DML 自动维护, 无需手动刷新。
+    """
+    doc_id = (doc_id or "").strip()
+    if not doc_id:
+        raise ValueError("replace_doc 需要非空 doc_id")
+    if not docs:
+        raise ValueError("replace_doc 需要非空 docs (删除请用 delete_by_doc_id)")
+
+    vectors = await _embed([d.page_content for d in docs])  # 事务外, 失败则旧数据原封不动
+    rows = _build_rows(docs, vectors, doc_id_override=doc_id)
+
+    table = _table()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(f"DELETE FROM {table} WHERE doc_id = $1", doc_id)
+            await conn.executemany(_insert_sql(table), rows)
     return len(rows)
 
 
@@ -329,17 +391,30 @@ async def list_sources() -> List[Tuple[str, int]]:
     return [(r["source"] or "unknown", int(r["cnt"])) for r in records]
 
 
+def _affected(status: str) -> int:
+    """从 asyncpg 命令状态串 (如 'DELETE 3') 取受影响行数。"""
+    try:
+        return int(status.split()[-1])
+    except (ValueError, IndexError):
+        return 0
+
+
 async def delete_by_source(source: str) -> int:
     """按 source 删除所有相关 chunk, 返回删除条数。"""
     table = _table()
     pool = await get_pool()
     async with pool.acquire() as conn:
         status = await conn.execute(f"DELETE FROM {table} WHERE source = $1", source)
-    # asyncpg 返回 "DELETE <n>"
-    try:
-        return int(status.split()[-1])
-    except (ValueError, IndexError):
-        return 0
+    return _affected(status)
+
+
+async def delete_by_doc_id(doc_id: str) -> int:
+    """按 doc_id 删除一篇文档的全部 chunk, 返回删除条数 (多源同步删除传播用)。"""
+    table = _table()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        status = await conn.execute(f"DELETE FROM {table} WHERE doc_id = $1", doc_id)
+    return _affected(status)
 
 
 async def is_ready() -> bool:
