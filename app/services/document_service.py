@@ -11,7 +11,6 @@ from typing import List
 from fastapi import UploadFile
 from loguru import logger
 
-from app.config import settings
 from app.core import pg_vector_store
 from app.core.splitter import split_markdown
 from app.exceptions import (
@@ -62,15 +61,7 @@ async def upload_document(file: UploadFile) -> UploadResponse:
 
     logger.info(f"[document] {filename}: 索引 {len(chunks)} 个 chunk")
 
-    # 若启用 Hybrid Search, 上传后立刻重建 BM25 索引
-    # 为什么放在这里: 保证下一次 RAG 查询就能用新文档; 失败不阻断上传
-    if settings.rag_hybrid_enabled and settings.rag_bm25_refresh_on_upload:
-        try:
-            from app.core.hybrid_retriever import refresh_bm25_index
-
-            await refresh_bm25_index()
-        except Exception as e:
-            logger.warning(f"[document] BM25 刷新失败 (忽略): {type(e).__name__}: {e}")
+    # BM25 走 ParadeDB pg_search, 索引随 INSERT 自动维护, 无需手动刷新。
 
     return UploadResponse(
         source=filename,
@@ -108,14 +99,7 @@ async def delete_document(source: str) -> int:
 
     logger.info(f"[document] 删除 {source}: {deleted} 个 chunk")
 
-    # 同步刷新 BM25 索引 (避免删除后 BM25 仍能命中已删文档)
-    if settings.rag_hybrid_enabled and settings.rag_bm25_refresh_on_upload:
-        try:
-            from app.core.hybrid_retriever import refresh_bm25_index
-
-            await refresh_bm25_index()
-        except Exception as e:
-            logger.warning(f"[document] BM25 刷新失败 (忽略): {type(e).__name__}: {e}")
+    # BM25 走 ParadeDB pg_search, 索引随 DELETE 自动维护, 无需手动刷新。
 
     return deleted
 

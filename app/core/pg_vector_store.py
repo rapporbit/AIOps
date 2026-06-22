@@ -31,6 +31,15 @@ from app.db.postgres import get_pool
 
 _SCHEMA_LOCK_KEY = 990002  # 与 incident schema (990001) 区分, 各自串行化 DDL
 
+# pg_search 分词器白名单: tokenizer 名要拼进 DDL (::pdb.<name>), 不能直接来自配置字符串,
+# 用白名单防注入。值见 ParadeDB tokenizers 文档。
+_BM25_TOKENIZERS = {"chinese_compatible", "chinese_lindera", "icu", "jieba", "default"}
+
+
+def _bm25_tokenizer() -> str:
+    tok = (settings.kb_bm25_tokenizer or "chinese_compatible").strip()
+    return tok if tok in _BM25_TOKENIZERS else "chinese_compatible"
+
 
 def _embedding_dim() -> int:
     """当前 embedding provider 对应的向量维度 (建表时定死)。"""
@@ -100,9 +109,28 @@ async def init_vector_schema() -> None:
                 WITH (m = {m}, ef_construction = {ef_construction})
                 """
             )
+
+            # 词法检索: ParadeDB pg_search BM25 索引 (随写入自动维护, 无内存截断)。
+            # 失败不致命: 没有 pg_search (非 ParadeDB 镜像) 时降级为纯向量, 只 warning。
+            tokenizer = _bm25_tokenizer()
+            try:
+                await conn.execute("CREATE EXTENSION IF NOT EXISTS pg_search")
+                await conn.execute(
+                    f"""
+                    CREATE INDEX IF NOT EXISTS idx_{table}_bm25 ON {table}
+                    USING bm25 (id, (content::pdb.{tokenizer}), source)
+                    WITH (key_field = 'id')
+                    """
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"[pgvector] pg_search BM25 索引未建 (混合检索将降级为纯向量): "
+                    f"{type(exc).__name__}: {exc}。如需 BM25, 请用 ParadeDB 镜像 "
+                    f"(paradedb/paradedb) 并把 pg_search 加入 shared_preload_libraries。"
+                )
         finally:
             await conn.execute("SELECT pg_advisory_unlock($1)", _SCHEMA_LOCK_KEY)
-    logger.info(f"[pgvector] schema ready: table={table}, dim={dim}")
+    logger.info(f"[pgvector] schema ready: table={table}, dim={dim}, bm25={_bm25_tokenizer()}")
 
 
 async def add_documents(docs: List[Document]) -> int:
@@ -209,43 +237,62 @@ async def similarity_search(
     return [_record_to_document(r) for r in records]
 
 
-async def load_all_chunks(limit: int = 100_000) -> List[Document]:
-    """拉全量 chunks (用于构建内存 BM25 索引), 不含向量。
+async def bm25_search(
+    query: str,
+    k: Optional[int] = None,
+    *,
+    source: Optional[str] = None,
+) -> List[Document]:
+    """ParadeDB pg_search BM25 词法检索, 返回按相关性降序的 top-k。失败返回 []。
 
-    注意: limit 是给"全量塞进进程内存建 BM25"兜的一道防御性上限, 不是 DB 限制。
-    一旦命中, 超出部分 (按 id, 即最新插入的那批) 不会进 BM25, 混合检索会悄悄退化成
-    只剩向量那一路 —— 所以这里必须打 warning 让它"出声"。根治办法见 hybrid_retriever
-    docstring: 改用 Postgres 侧 BM25 (ParadeDB pg_search) / 全文检索, 不再全量入内存。
+    取代原"全量拉进内存建 rank_bm25"的做法: 索引由 pg_search 随写入自动维护,
+    无内存占用、无截断上限、多进程共享同一份。
+
+    用 paradedb.match('content', $1) 构造查询 (而非 content @@@ '<原始串>'),
+    这样 query 里的 :, +, ", - 等不会被当成 pg_search 查询 DSL 误解析。
     """
+    k = int(k or settings.rag_top_k)
+    if k <= 0 or not (query or "").strip():
+        return []
+
     table = _table()
+    params: List[Any] = [query]
+    where_extra = ""
+    if source:
+        params.append(source)
+        where_extra = f"AND source = ${len(params)}"
+    params.append(k)
+    limit_pos = len(params)
+
+    sql = f"""
+        SELECT content, source, chapter, parent_id, parent_content,
+               chunk_index, metadata, paradedb.score(id) AS bm25_score
+        FROM {table}
+        WHERE id @@@ paradedb.match('content', $1)
+        {where_extra}
+        ORDER BY bm25_score DESC
+        LIMIT ${limit_pos}
+    """
+
     try:
         pool = await get_pool()
         async with pool.acquire() as conn:
-            records = await conn.fetch(
-                f"""
-                SELECT content, source, chapter, parent_id, parent_content, chunk_index
-                FROM {table}
-                ORDER BY id
-                LIMIT $1
-                """,
-                int(limit),
-            )
+            records = await conn.fetch(sql, *params)
     except Exception as e:
-        logger.warning(f"[pgvector] load_all_chunks 失败 (降级): {type(e).__name__}: {e}")
+        # 没建 BM25 索引 / 非 ParadeDB 等: 降级为空, 让混合检索回退到纯向量
+        logger.warning(f"[pgvector] bm25_search 失败 (降级为纯向量): {type(e).__name__}: {e}")
         return []
-
-    if len(records) >= int(limit):
-        logger.warning(
-            f"[pgvector] BM25 语料已达上限 {limit} 行并被截断: 超出部分 (最新插入的 chunk) "
-            f"不会进入 BM25 索引, 混合检索对这些文档将只剩向量召回。"
-            f"请尽快改用 Postgres 侧 BM25 (ParadeDB pg_search) 替代内存 BM25。"
-        )
 
     docs: List[Document] = []
     for r in records:
         content = r["content"] or ""
         if not content:
             continue
+        score = r["bm25_score"]
+        try:
+            score_val = float(score) if score is not None else None
+        except (TypeError, ValueError):
+            score_val = None
         docs.append(
             Document(
                 page_content=content,
@@ -255,6 +302,7 @@ async def load_all_chunks(limit: int = 100_000) -> List[Document]:
                     "parent_id": r["parent_id"] or "",
                     "parent_content": r["parent_content"] or "",
                     "chunk_index": r["chunk_index"],
+                    "bm25_score": score_val,
                 },
             )
         )

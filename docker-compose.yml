@@ -26,9 +26,15 @@ services:
 
   postgres:
     container_name: multi-agent-postgres
-    # pgvector 官方镜像 (postgres 16 + vector 扩展), 替代原 postgres:16-alpine,
-    # 否则 CREATE EXTENSION vector 会失败。
-    image: pgvector/pgvector:pg16
+    # ParadeDB 发行版 = Postgres + pgvector + pg_search(BM25)。一镜像同时承载
+    # 向量检索 (vector 扩展) 和词法检索 (pg_search BM25), 事故台账也照常跑。
+    # 固定 pg16 大版本以兼容现有数据卷 (multi_agent_postgres 是 PG16); 升级 PG 大版本
+    # 需 pg_dump 迁移, 不能直接换 tag。
+    image: paradedb/paradedb:0.24.1-pg16
+    # pg_search 必须进 shared_preload_libraries。ParadeDB 镜像只在"全新 initdb"时
+    # 自动写入; 复用旧 PG16 数据卷时其 conf 没有, 故用命令行 -c 显式注入 (覆盖 conf,
+    # 对新卷/旧卷都成立)。vector(pgvector) 不需要 preload。
+    command: ["postgres", "-c", "shared_preload_libraries=pg_search"]
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-multi_agent_aiops}
       POSTGRES_USER: ${POSTGRES_USER:-multi_agent}

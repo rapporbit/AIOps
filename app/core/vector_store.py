@@ -63,7 +63,7 @@ async def advanced_search(
         List[Document]: 最终 top-k, 不抛异常.
     """
     # 延迟导入避免循环依赖
-    from app.core.hybrid_retriever import _bm25_index, hybrid_search, refresh_bm25_index
+    from app.core.hybrid_retriever import hybrid_search
     from app.core.reranker import rerank_docs
 
     final_k = k or settings.rag_top_k
@@ -84,13 +84,9 @@ async def advanced_search(
     # ---------- Step 2: Hybrid 融合 ----------
     candidates = vector_docs
     if use_hybrid:
-        # 首次调用时惰性构建 BM25 索引 (从 pgvector 拉全量)
-        if not _bm25_index.is_ready:
-            try:
-                await refresh_bm25_index()
-            except Exception as e:
-                logger.warning(f"[advanced_search] BM25 lazy build 失败: {type(e).__name__}: {e}")
-        candidates = hybrid_search(query, vector_docs, k=retrieve_k, retrieve_k=retrieve_k)
+        # BM25 走 ParadeDB pg_search (DB 侧索引, 失败自动返回 [] 退回纯向量)
+        bm25_docs = await pg_vector_store.bm25_search(query, k=retrieve_k, source=filter or None)
+        candidates = hybrid_search(query, vector_docs, bm25_docs, k=retrieve_k)
 
     # ---------- Step 3: Rerank 精排 ----------
     if use_rerank and len(candidates) > final_k:

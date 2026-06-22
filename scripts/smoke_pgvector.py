@@ -2,7 +2,7 @@
 
 验证 app/core/pg_vector_store.py 的全部 DB 侧代码路径:
   CREATE EXTENSION vector / 建表 / HNSW 索引 / ::vector 字面量 / <=> 距离 /
-  SET LOCAL hnsw.ef_search / source 过滤 / list_sources / load_all_chunks /
+  SET LOCAL hnsw.ef_search / source 过滤 / list_sources / bm25_search (pg_search) /
   delete_by_source / is_ready。
 
 为什么能免 embedding API:
@@ -118,10 +118,14 @@ async def _run() -> None:
         _check(top_score is not None and top_score > 0.99, f"top-1 score≈1.0 (实际 {top_score})")
         _check(hits[0].metadata.get("parent_content", "").startswith("[父块]"), "parent_content 正确回传")
 
-        logger.info("5) load_all_chunks (BM25 用) 能拿到本测试数据")
-        all_docs = await pg_vector_store.load_all_chunks()
-        mine = [d for d in all_docs if d.metadata.get("source") == SMOKE_SOURCE]
-        _check(len(mine) == 3, f"load_all_chunks 含本测试 3 条 (实际 {len(mine)})")
+        logger.info("5) bm25_search (ParadeDB pg_search 词法检索 + source 过滤)")
+        bm = await pg_vector_store.bm25_search("Redis OOM", k=5, source=SMOKE_SOURCE)
+        _check(len(bm) >= 1, f"bm25_search 至少命中 1 条 (实际 {len(bm)})")
+        _check(
+            any(d.page_content == docs[0].page_content for d in bm),
+            "BM25 命中含 'Redis ... OOM' 的那条 (词法匹配正确)",
+        )
+        _check(bm[0].metadata.get("bm25_score") is not None, "bm25_score 已回传")
 
         logger.info("6) delete_by_source 清理 + 计数")
         deleted = await pg_vector_store.delete_by_source(SMOKE_SOURCE)

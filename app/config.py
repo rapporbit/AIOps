@@ -97,6 +97,14 @@ class Settings(BaseSettings):
             "只影响查询召回/延迟, 不需要重建索引 (每查询用 SET LOCAL 生效)."
         ),
     )
+    # BM25 (ParadeDB pg_search): 词法检索从内存 rank_bm25 迁到 DB 侧 pg_search,
+    # 索引随写入自动维护, 无内存截断/多进程各建一份问题。分词器决定中英文切分方式:
+    #   chinese_compatible = 中文按字 (与原内存 BM25 行为一致, 最稳)
+    #   chinese_lindera    = 中文按词 (更准, 需重跑评测确认)
+    kb_bm25_tokenizer: str = Field(
+        default="chinese_compatible",
+        description="pg_search BM25 分词器: chinese_compatible / chinese_lindera / icu / jieba",
+    )
 
     # ==================== RAG 基础 ====================
     # Parent-Child 切分: rag_chunk_size 是 child 块大小 (embedding 用, 小=召回准);
