@@ -137,6 +137,10 @@ class Settings(BaseSettings):
         default=120.0, description="飞书文档导出 (export_task) 总超时秒"
     )
 
+    # ==================== 知识库同步调度 ====================
+    kb_sync_enabled: bool = Field(default=True, description="启用定时同步调度器")
+    kb_sync_interval_sec: int = Field(default=1800, description="各数据源同步轮询间隔秒 (默认30min)")
+
     # ==================== RAG 基础 ====================
     # Parent-Child 切分: rag_chunk_size 是 child 块大小 (embedding 用, 小=召回准);
     # rag_parent_max_chars 是 parent 块上限 (拼 LLM context 用, 大=上下文全)。

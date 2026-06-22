@@ -61,6 +61,16 @@ async def list_sources() -> List[KbSource]:
     return [_row_to_source(r) for r in rows]
 
 
+async def list_enabled_sources() -> List[KbSource]:
+    """仅返回启用的数据源 (定时调度器用)。"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, type, name, config FROM kb_source WHERE enabled = TRUE ORDER BY created_at"
+        )
+    return [_row_to_source(r) for r in rows]
+
+
 async def get_source(source_id: str) -> Optional[KbSource]:
     pool = await get_pool()
     async with pool.acquire() as conn:

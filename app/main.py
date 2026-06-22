@@ -31,6 +31,7 @@ from app.config import settings
 from app.core import pg_vector_store
 from app.core.kb_sync_schema import init_kb_sync_schema
 from app.core.mcp_client import mcp_client_manager
+from app.services.kb_scheduler import start_scheduler, stop_scheduler
 from app.db.postgres import close_postgres, connect_postgres, init_incident_schema
 from app.exceptions import AppException
 from app.logging_config import setup_logging
@@ -71,10 +72,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # 4. 加载 MCP 工具 (可选依赖, 失败仅 warning)
     await mcp_client_manager.connect(fail_silently=True)
 
+    # 5. 启动知识库定时同步调度器 (KB_SYNC_ENABLED=false 则跳过)
+    start_scheduler()
+
     logger.info("应用就绪, 等待请求...")
     yield
     # ==================== 关闭 ====================
     logger.info("应用正在关闭...")
+    await stop_scheduler()
     await mcp_client_manager.close()
     if settings.incident_pipeline_enabled:
         await incident_queue.close()
