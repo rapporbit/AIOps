@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Redis Streams 任务队列 · Worker 架构</title>
+<style>
+  :root {
+    --bg: #faf9f5; --bg2: #ffffff; --card: #ffffff;
+    --ctp: #1a1a18; --cts: #5f5e5a; --cline: #888780;
+    --border: rgba(0,0,0,0.12);
+    --teal-f:#E1F5EE; --teal-s:#0F6E56; --teal-t:#085041; --teal-st:#0F6E56;
+    --pink-f:#FBEAF0; --pink-s:#993556; --pink-t:#72243E; --pink-st:#993556;
+    --green-f:#EAF3DE; --green-s:#3B6D11; --green-t:#27500A; --green-st:#3B6D11;
+    --red-f:#FCEBEB; --red-s:#A32D2D; --red-t:#791F1F; --red-st:#A32D2D;
+    --gray-f:#F1EFE8; --gray-s:#5F5E5A; --gray-t:#444441; --gray-st:#5F5E5A;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1f1e1b; --bg2: #262521; --card: #262521;
+      --ctp: #f0eee6; --cts: #b4b2a9; --cline: #888780;
+      --border: rgba(255,255,255,0.14);
+      --teal-f:#085041; --teal-s:#5DCAA5; --teal-t:#9FE1CB; --teal-st:#5DCAA5;
+      --pink-f:#72243E; --pink-s:#ED93B1; --pink-t:#F4C0D1; --pink-st:#ED93B1;
+      --green-f:#27500A; --green-s:#97C459; --green-t:#C0DD97; --green-st:#97C459;
+      --red-f:#501313; --red-s:#F09595; --red-t:#F7C1C1; --red-st:#F09595;
+      --gray-f:#444441; --gray-s:#B4B2A9; --gray-t:#D3D1C7; --gray-st:#B4B2A9;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px 20px 64px; background: var(--bg);
+    color: var(--ctp);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    line-height: 1.65;
+  }
+  .wrap { max-width: 820px; margin: 0 auto; }
+  h1 { font-size: 26px; margin: 0 0 4px; }
+  h2 { font-size: 19px; margin: 40px 0 4px; }
+  h3 { font-size: 16px; margin: 24px 0 4px; }
+  .sub { color: var(--cts); margin: 0 0 8px; font-size: 14px; }
+  .card { background: var(--card); border: 0.5px solid var(--border);
+          border-radius: 16px; padding: 20px; margin: 16px 0 24px; }
+  p, li { color: var(--ctp); font-size: 15px; }
+  strong { font-weight: 600; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+         background: var(--bg2); border: 0.5px solid var(--border);
+         border-radius: 5px; padding: 1px 5px; font-size: 13px; }
+  ul { padding-left: 22px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 13px;
+            color: var(--cts); margin: 4px 0 0; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .dot { width: 11px; height: 11px; border-radius: 3px; display: inline-block; }
+
+  svg .t  { font-size: 14px; font-weight: 400; fill: var(--ctp); }
+  svg .th { font-size: 14px; font-weight: 500; fill: var(--ctp); }
+  svg .ts { font-size: 12px; font-weight: 400; fill: var(--cts); }
+  svg .arr { stroke: var(--cline); stroke-width: 1.5; fill: none; }
+  svg .c-teal rect { fill: var(--teal-f); stroke: var(--teal-s); }
+  svg .c-teal .t, svg .c-teal .th { fill: var(--teal-t); }
+  svg .c-teal .ts { fill: var(--teal-st); }
+  svg .c-pink rect { fill: var(--pink-f); stroke: var(--pink-s); }
+  svg .c-pink .t, svg .c-pink .th { fill: var(--pink-t); }
+  svg .c-pink .ts { fill: var(--pink-st); }
+  svg .c-green rect { fill: var(--green-f); stroke: var(--green-s); }
+  svg .c-green .t, svg .c-green .th { fill: var(--green-t); }
+  svg .c-green .ts { fill: var(--green-st); }
+  svg .c-red rect { fill: var(--red-f); stroke: var(--red-s); }
+  svg .c-red .t, svg .c-red .th { fill: var(--red-t); }
+  svg .c-red .ts { fill: var(--red-st); }
+  svg .c-gray rect { fill: var(--gray-f); stroke: var(--gray-s); }
+  svg .c-gray .t, svg .c-gray .th { fill: var(--gray-t); }
+  svg .c-gray .ts { fill: var(--gray-st); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Redis Streams 任务队列 · Worker 架构</h1>
+  <p class="sub">代码: <code>app/queue/redis_streams.py</code> · <code>app/diagnosis_worker.py</code> · <code>app/core/distributed_limiter.py</code></p>
+
+  <h2>1 · 端到端通路</h2>
+  <p class="sub">生产者 XADD 入队 → 按优先级分流 → 消费组多 Worker 消费 → 成功落库 / 失败进死信</p>
+  <div class="legend">
+    <span><i class="dot" style="background:var(--gray-s)"></i>生产者 / 结构容器</span>
+    <span><i class="dot" style="background:var(--pink-s)"></i>优先级子流</span>
+    <span><i class="dot" style="background:var(--teal-s)"></i>Worker</span>
+    <span><i class="dot" style="background:var(--green-s)"></i>成功落库</span>
+    <span><i class="dot" style="background:var(--red-s)"></i>死信</span>
+  </div>
+  <div class="card">
+    <svg width="100%" viewBox="0 0 680 520" role="img" xmlns="http://www.w3.org/2000/svg">
+      <title>Redis Streams 任务队列端到端流程</title>
+      <desc>生产者通过 XADD 写入按优先级分流的 Redis Streams，diagnosis-workers 消费组里的多个 worker 用 XREADGROUP 消费并 XACK，成功落库 Postgres，不可恢复的进死信队列。</desc>
+      <defs>
+        <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </marker>
+      </defs>
+
+      <g class="c-gray">
+        <rect x="240" y="30" width="200" height="56" rx="8" stroke-width="0.5"/>
+        <text class="th" x="340" y="50" text-anchor="middle" dominant-baseline="central">生产者 Producers</text>
+        <text class="ts" x="340" y="68" text-anchor="middle" dominant-baseline="central">webhook · manual · chat</text>
+      </g>
+
+      <line x1="340" y1="86" x2="340" y2="116" class="arr" marker-end="url(#arrow)"/>
+      <text class="ts" x="358" y="103" text-anchor="start">XADD</text>
+
+      <rect x="90" y="118" width="500" height="126" rx="16" fill="none" stroke="var(--border)" stroke-width="0.5" stroke-dasharray="4 4"/>
+      <text class="th" x="340" y="138" text-anchor="middle">Redis Streams</text>
+      <text class="ts" x="340" y="156" text-anchor="middle">aiops:incident_tasks · 按优先级分流</text>
+
+      <g class="c-pink">
+        <rect x="106" y="176" width="108" height="40" rx="6" stroke-width="0.5"/>
+        <text class="th" x="160" y="196" text-anchor="middle" dominant-baseline="central">critical</text>
+      </g>
+      <g class="c-pink">
+        <rect x="226" y="176" width="108" height="40" rx="6" stroke-width="0.5"/>
+        <text class="th" x="280" y="196" text-anchor="middle" dominant-baseline="central">high</text>
+      </g>
+      <g class="c-pink">
+        <rect x="346" y="176" width="108" height="40" rx="6" stroke-width="0.5"/>
+        <text class="th" x="400" y="196" text-anchor="middle" dominant-baseline="central">normal</text>
+      </g>
+      <g class="c-pink">
+        <rect x="466" y="176" width="108" height="40" rx="6" stroke-width="0.5"/>
+        <text class="th" x="520" y="196" text-anchor="middle" dominant-baseline="central">low</text>
+      </g>
+
+      <line x1="340" y1="244" x2="340" y2="274" class="arr" marker-end="url(#arrow)"/>
+      <text class="ts" x="358" y="261" text-anchor="start">XREADGROUP</text>
+
+      <rect x="90" y="276" width="500" height="120" rx="16" fill="none" stroke="var(--border)" stroke-width="0.5" stroke-dasharray="4 4"/>
+      <text class="th" x="340" y="298" text-anchor="middle">消费组 diagnosis-workers</text>
+      <text class="ts" x="340" y="316" text-anchor="middle">优先级顺序读 · PEL 跟踪未确认</text>
+
+      <g class="c-teal">
+        <rect x="106" y="330" width="140" height="50" rx="8" stroke-width="0.5"/>
+        <text class="th" x="176" y="355" text-anchor="middle" dominant-baseline="central">worker-1</text>
+      </g>
+      <g class="c-teal">
+        <rect x="266" y="330" width="140" height="50" rx="8" stroke-width="0.5"/>
+        <text class="th" x="336" y="355" text-anchor="middle" dominant-baseline="central">worker-2</text>
+      </g>
+      <g class="c-teal">
+        <rect x="426" y="330" width="140" height="50" rx="8" stroke-width="0.5"/>
+        <text class="th" x="496" y="355" text-anchor="middle" dominant-baseline="central">worker-3</text>
+      </g>
+
+      <path d="M90 336 L40 336 L40 210 L88 210" class="arr" fill="none" marker-end="url(#arrow)"/>
+      <text class="ts" x="46" y="272" text-anchor="start">XACK</text>
+
+      <line x1="340" y1="396" x2="217" y2="428" class="arr" marker-end="url(#arrow)"/>
+      <line x1="340" y1="396" x2="483" y2="428" class="arr" marker-end="url(#arrow)"/>
+      <text class="ts" x="250" y="414" text-anchor="start">succeed</text>
+      <text class="ts" x="436" y="414" text-anchor="start">exhausted</text>
+
+      <g class="c-green">
+        <rect x="110" y="430" width="210" height="60" rx="8" stroke-width="0.5"/>
+        <text class="th" x="215" y="452" text-anchor="middle" dominant-baseline="central">Postgres</text>
+        <text class="ts" x="215" y="470" text-anchor="middle" dominant-baseline="central">diagnosis_tasks status</text>
+      </g>
+      <g class="c-red">
+        <rect x="400" y="430" width="170" height="60" rx="8" stroke-width="0.5"/>
+        <text class="th" x="485" y="452" text-anchor="middle" dominant-baseline="central">DLQ stream</text>
+        <text class="ts" x="485" y="470" text-anchor="middle" dominant-baseline="central">unrecoverable</text>
+      </g>
+    </svg>
+  </div>
+  <p>队列消息只是"触发器"，任务的事实状态机（<code>pending → running → succeeded / failed</code>、<code>attempts</code> 计数）落在 Postgres 的 <code>diagnosis_tasks</code> 表。<code>XACK</code> 把消息从消费组的 PEL（Pending Entries List）移除；Worker 崩溃时未 ACK 的消息会被下一轮 <code>XAUTOCLAIM</code> 重新认领。</p>
+
+  <h2>2 · 单条消息的处理与容错</h2>
+  <p class="sub">每个 Worker 对一条消息的完整生命周期：认领 → 校验 → 执行 → 落库 / 重试 / 死信</p>
+  <div class="card">
+    <svg width="100%" viewBox="0 0 680 420" role="img" xmlns="http://www.w3.org/2000/svg">
+      <title>Worker 单条消息处理与容错流程</title>
+      <desc>worker 先 XAUTOCLAIM 认领超时消息再 XREADGROUP 读新消息，从 Postgres 加载任务做幂等与重试上限校验，标记 running 后在分布式槽与超时下执行诊断；成功则落库并 XACK，失败时按剩余次数重新入队或进入死信队列。</desc>
+      <defs>
+        <marker id="arrow2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </marker>
+      </defs>
+
+      <g class="c-teal">
+        <rect x="90" y="40" width="220" height="56" rx="8" stroke-width="0.5"/>
+        <text class="th" x="200" y="60" text-anchor="middle" dominant-baseline="central">轮询取任务</text>
+        <text class="ts" x="200" y="78" text-anchor="middle" dominant-baseline="central">XAUTOCLAIM → XREADGROUP</text>
+      </g>
+      <line x1="200" y1="96" x2="200" y2="126" class="arr" marker-end="url(#arrow2)"/>
+
+      <g class="c-teal">
+        <rect x="90" y="128" width="220" height="56" rx="8" stroke-width="0.5"/>
+        <text class="th" x="200" y="148" text-anchor="middle" dominant-baseline="central">加载任务 + 校验</text>
+        <text class="ts" x="200" y="166" text-anchor="middle" dominant-baseline="central">幂等 · 重试上限</text>
+      </g>
+      <line x1="200" y1="184" x2="200" y2="214" class="arr" marker-end="url(#arrow2)"/>
+
+      <g class="c-teal">
+        <rect x="90" y="216" width="220" height="56" rx="8" stroke-width="0.5"/>
+        <text class="th" x="200" y="236" text-anchor="middle" dominant-baseline="central">执行诊断</text>
+        <text class="ts" x="200" y="254" text-anchor="middle" dominant-baseline="central">分布式槽 · 10 分钟超时</text>
+      </g>
+      <line x1="200" y1="272" x2="200" y2="302" class="arr" marker-end="url(#arrow2)"/>
+      <text class="ts" x="218" y="289" text-anchor="start">success</text>
+
+      <g class="c-green">
+        <rect x="90" y="304" width="220" height="56" rx="8" stroke-width="0.5"/>
+        <text class="th" x="200" y="324" text-anchor="middle" dominant-baseline="central">标记成功 + XACK</text>
+        <text class="ts" x="200" y="342" text-anchor="middle" dominant-baseline="central">报告写入 Postgres</text>
+      </g>
+
+      <path d="M90 252 L40 252 L40 68 L88 68" class="arr" fill="none" marker-end="url(#arrow2)"/>
+      <text class="ts" x="46" y="114" text-anchor="start">retry: XADD</text>
+
+      <line x1="310" y1="156" x2="438" y2="172" class="arr" marker-end="url(#arrow2)"/>
+      <text class="ts" x="322" y="150" text-anchor="start">not found / 超限</text>
+
+      <line x1="310" y1="252" x2="438" y2="244" class="arr" marker-end="url(#arrow2)"/>
+      <text class="ts" x="330" y="270" text-anchor="start">最终失败</text>
+
+      <g class="c-red">
+        <rect x="440" y="150" width="180" height="120" rx="8" stroke-width="0.5"/>
+        <text class="th" x="530" y="200" text-anchor="middle" dominant-baseline="central">DLQ</text>
+        <text class="ts" x="530" y="222" text-anchor="middle" dominant-baseline="central">不可恢复任务</text>
+      </g>
+    </svg>
+  </div>
+  <p>容错有三道闸：<strong>幂等</strong>（任务已 <code>succeeded</code> 直接 ACK 跳过，避免重复写 Evidence）、<strong>重试</strong>（失败且 <code>attempts &lt; max_attempts</code> → 改回 pending、重新 XADD 入同优先级流、再 ACK 原消息）、<strong>死信</strong>（任务不存在 / 超过重试上限 / 最终失败 → 写 <code>aiops:incident_tasks:dlq</code>，保留 <code>raw_item</code> 供排查重放）。</p>
+
+  <h2>3 · 三个关键概念</h2>
+
+  <h3>Worker 到底指什么</h3>
+  <p>Worker 不是线程、不是协程，而是一个<strong>独立的操作系统进程</strong>——<code>python -m app.diagnosis_worker</code> 启动的 <code>DiagnosisWorker</code> 实例。它的本质是 Redis 消费组 <code>diagnosis-workers</code> 里的一个 consumer，用一个唯一的 <strong>consumer name</strong>（<code>worker-1</code>/<code>worker-2</code>/…，来自 <code>--name</code> 或环境变量 <code>DIAGNOSIS_WORKER_ID</code>）向 Redis 标识自己。</p>
+  <ul>
+    <li><strong>进程内是单线程 asyncio 事件循环</strong>：靠 <code>await</code> 做 I/O 并发，没有多线程。一个 Worker 进程同一时刻只跑一个诊断主循环（<code>count=1</code>，一次取一条）。</li>
+    <li><strong>横向扩展靠多进程</strong>：起 3 个进程就是 3 个 worker，共享同一个消费组，Redis 自动把不同消息分发给不同 consumer，互不重复。</li>
+    <li><strong>每个 Worker 自带心跳</strong>：后台协程定期写 <code>aiops:worker:diagnosis-workers:{name}:heartbeat</code>（带 TTL），用于 <code>/queue/status</code> 判断存活——心跳只是运行态信号，不是事实库。</li>
+  </ul>
+  <p>所以一个 worker = 一个进程 = 消费组里的一个 consumer，靠 consumer name 唯一标识、靠心跳证明活着、靠下面的分布式槽与同伴协调全局并发。</p>
+
+  <h3>优先级抢占的两段式读</h3>
+  <p>Redis Streams 的 <code>XREADGROUP</code> 原生不支持"跨多条流按优先级取"。<code>BLOCK</code> 模式监听多条流时，规则是"任一条有数据就返回"，<strong>不保证返回的是最高优先级那条</strong>。于是 <code>read_tasks()</code> 用两段式绕开这个限制：</p>
+  <ul>
+    <li><strong>第一段（非阻塞优先级扫描）</strong>：按 <code>critical → high → normal → low</code> 顺序，对每条流各发一次 <code>block=None</code> 的非阻塞 <code>XREADGROUP</code>，<strong>命中即立刻返回</strong>，绝不去看更低优先级的流。这就是"严格抢占"——只要 critical 有货，永远先于 low 被处理。</li>
+    <li><strong>第二段（阻塞兜底）</strong>：四条流全空时，对所有流发一次 <code>block=5000ms</code> 的阻塞读，把空转交给 Redis 内核，零 CPU。一旦被唤醒，<strong>不直接用这次的结果</strong>，而是回到主循环重新走第一段——这样即使阻塞读唤醒时返回的是 low，下一轮扫描仍会先把这期间到达的 critical 取走。</li>
+  </ul>
+  <p>两段配合：第一段保证优先级正确性，第二段保证空闲时不烧 CPU。代价是每次扫描多发几次轻量命令，但诊断任务本身要跑几十秒，这点开销可忽略。</p>
+
+  <h3>分布式并发槽（distributed slot）</h3>
+  <p>问题根源：<code>asyncio.Semaphore</code> 只在单进程内有效。一旦 <code>uvicorn --workers 4</code> 或起多个 Worker 进程，每个进程各有一份信号量，全局并发被放大 N 倍，限流形同虚设。解决办法是把"槽位"放到 Redis 上，让所有进程共享同一个上限。</p>
+  <ul>
+    <li><strong>数据结构</strong>：每种资源一个 ZSET <code>aiops:limiter:{resource}</code>。member = 唯一 token（<code>host:pid:uuid</code>），score = 该槽的过期时间（毫秒）。占用数 = ZSET 基数。</li>
+    <li><strong>原子抢槽</strong>：用一段 Lua 脚本在 Redis 服务端原子完成「<code>ZREMRANGEBYSCORE</code> 清过期 → <code>ZCARD</code> 数当前 → 没满则 <code>ZADD</code> 占一个槽」，避免 check-then-act 竞态；用服务端 <code>TIME</code> 取时间，规避客户端时钟漂移。</li>
+    <li><strong>TTL + 心跳续期</strong>：槽带 TTL，进程崩溃来不及释放时到期自动清掉，不会永久泄漏；长任务运行期间后台协程定期把自己 token 的 score 往后推（<code>refresh_interval</code> 默认 30s，TTL 默认 90s），防止被误清。正常结束在 <code>finally</code> 里 <code>ZREM</code> 释放。</li>
+    <li><strong>两种获取语义</strong>：<code>wait=False</code> 抢不到立刻抛 <code>DistributedLimitBusy</code>（用于同步入口，满了就拒绝/入队）；<code>wait=True</code> 抢不到就轮询等待（Worker 用这个，尊重全局上限、满了排队）。</li>
+    <li><strong>pause / resume</strong>：通过 contextvar 暴露当前槽句柄，等待人工审批这类不确定时长的阻塞时可以先 <code>pause()</code> 让出槽（停心跳 + 释放），审批结束 <code>resume()</code> 重新抢回，避免空占并发。</li>
+    <li><strong>容错 fail-open</strong>：Redis 不可达时直接放行并告警。理由是整条链路本就强依赖 Redis，真挂了一切都不工作，限流层不该再叠一层硬失败把诊断也拖死——宁可短暂失去全局上限，也不让限流器成为新的单点。</li>
+  </ul>
+  <p>Worker 执行诊断时正是用 <code>async with distributed_slot("worker_diagnosis", limit=worker_diagnosis_concurrency, wait=True)</code> 包住实际诊断调用：无论起多少个 Worker 进程，同时真正在跑的诊断数都不超过这个全局上限。</p>
+</div>
+</body>
+</html>
