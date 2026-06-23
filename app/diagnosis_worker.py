@@ -19,7 +19,7 @@ from loguru import logger
 
 from app.orchestration.audit import run_legacy_langgraph_with_audit
 from app.config import settings
-from app.core.distributed_limiter import distributed_slot
+from app.core.distributed_limiter import DistributedLimitBusy, distributed_slot
 from app.core.mcp_client import mcp_client_manager
 from app.db.postgres import close_postgres, connect_postgres, init_incident_schema
 from app.incidents.repository import incident_repository
@@ -52,21 +52,35 @@ class DiagnosisWorker:
         logger.info(f"[diagnosis-worker] started consumer={self.consumer_name}")
 
         while not self._stopping.is_set():
-            # 先尝试回收 stale pending 任务, 再读新任务。
-            # 为什么放在这里:
-            # - 普通 XREADGROUP 只读新消息, 不会自动处理崩溃 Worker 留下的 pending;
-            # - 每轮先 reclaim, 可以让旧任务恢复执行。
-            tasks = await self._claim_stale_tasks_once()
-            if not tasks:
-                tasks = await incident_queue.read_tasks(
-                    consumer_name=self.consumer_name,
-                    count=1,
-                    block_ms=settings.diagnosis_worker_block_ms,
-                )
-            if not tasks:
-                continue
-            for message_id, item in tasks:
-                await self.handle_message(message_id, item)
+            # 用并发槽 gate 住"读": 先抢全局 worker_diagnosis 槽 (wait=False), 拿到才去读/回收。
+            # 为什么这样:
+            # - Redis Streams 里 XREADGROUP = 把消息认领进自己的 PEL, "拉了就得跑";
+            # - 若先读再抢槽, 容量满时消息会堆在 PEL、状态虚标 running、还可能被别的 Worker
+            #   reclaim 双跑。改成"没容量就不碰 stream", 起再多 Worker 也只是多几个退避轮询者。
+            # - 持槽期间用阻塞读 (block_ms), 槽随 with 自动释放; current_slot 已由
+            #   distributed_slot 设好, 供 tool_runner 在等人工审批时 pause/resume。
+            try:
+                async with distributed_slot(
+                    "worker_diagnosis",
+                    limit=settings.worker_diagnosis_concurrency,
+                    ttl_seconds=settings.limiter_default_ttl_sec,
+                    refresh_interval_seconds=settings.limiter_default_refresh_sec,
+                    wait=False,
+                ):
+                    # 先尝试回收崩溃 Worker 留下的 stale pending, 再读新任务
+                    tasks = await self._claim_stale_tasks_once()
+                    if not tasks:
+                        tasks = await incident_queue.read_tasks(
+                            consumer_name=self.consumer_name,
+                            count=1,
+                            block_ms=settings.diagnosis_worker_block_ms,
+                        )
+                    if not tasks:
+                        continue
+                    for message_id, item in tasks:
+                        await self.handle_message(message_id, item)
+            except DistributedLimitBusy:
+                await asyncio.sleep(0.5)  # 容量满: 不读 stream, 短暂退避
 
     async def stop(self) -> None:
         self._stopping.set()
@@ -121,26 +135,20 @@ class DiagnosisWorker:
 
         logger.info(f"[diagnosis-worker] task={task_id} message={message_id} running")
         try:
+            # 并发槽已由主循环 (distributed_slot) 持有, 这里只标 running 再跑 —— 标 running
+            # 一定发生在已持槽之后, 状态不再虚标。
             await incident_repository.mark_task_running(task_id)
             # 为什么加 timeout:
             # - LLM/MCP/网络工具都有可能长时间不返回;
             # - 没有 timeout 时, 一个坏任务会永久占住 Worker;
             # - timeout 后走 retry/DLQ, 系统能继续消费后续任务。
             #
-            # 并发槽 (改造文档第 1/3 步): 所有 Worker 副本共享 worker_diagnosis 全局上限。
-            # wait=True 表示槽满了就等 (而不是超跑), 保证无论起多少个 Worker, 同时真正
-            # 在跑的诊断不超过 worker_diagnosis_concurrency。心跳续期防长任务被误回收。
-            async with distributed_slot(
-                "worker_diagnosis",
-                limit=settings.worker_diagnosis_concurrency,
-                ttl_seconds=settings.limiter_default_ttl_sec,
-                refresh_interval_seconds=settings.limiter_default_refresh_sec,
-                wait=True,
-            ):
-                result = await asyncio.wait_for(
-                    run_legacy_langgraph_with_audit(task_id, item),
-                    timeout=settings.diagnosis_task_timeout_sec,
-                )
+            # 这是含等人工审批时间的"墙钟超时": diagnosis_task_timeout_sec 已设得足够大
+            # (> 工作 + approvals_timeout_sec), 所以等审批不会被腰斩; 审批本身另有 300s 上限。
+            result = await asyncio.wait_for(
+                run_legacy_langgraph_with_audit(task_id, item),
+                timeout=settings.diagnosis_task_timeout_sec,
+            )
             await incident_repository.mark_task_succeeded(
                 task_id,
                 report=result.report,

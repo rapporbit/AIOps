@@ -196,6 +196,9 @@ CREATE TABLE IF NOT EXISTS evidence (
 );
 
 CREATE INDEX IF NOT EXISTS idx_evidence_incident_source ON evidence(incident_group_id, source, created_at DESC);
+-- incident_id 是 FK (ON DELETE SET NULL) 且有 DELETE ... WHERE incident_id = $1。
+-- Postgres 不会自动给 FK 列建索引, 没这条删 incident 时会全表扫 evidence (写最多的表)。
+CREATE INDEX IF NOT EXISTS idx_evidence_incident_id ON evidence(incident_id);
 
 CREATE TABLE IF NOT EXISTS agent_runs (
     id TEXT PRIMARY KEY,

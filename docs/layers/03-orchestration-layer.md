@@ -178,7 +178,7 @@ deep 模式可配置关闭，此时即使请求 deep 也降级到 fast，并在 
 | `manual_diagnosis_concurrency` | `2` | 同步 SSE 诊断并发上限 |
 | `limiter_default_ttl_sec` | `90` | 槽位自动过期时间 |
 | `limiter_default_refresh_sec` | `30` | 心跳续约间隔 |
-| `diagnosis_task_timeout_sec` | `600` | 单次诊断超时 (10 分钟) |
+| `diagnosis_task_timeout_sec` | `1800` | 单次诊断墙钟超时 (30 分钟, 含等人工审批的时间) |
 | `diagnosis_task_max_attempts` | `3` | 最大重试次数 |
 
 ## 模拟面试问答
