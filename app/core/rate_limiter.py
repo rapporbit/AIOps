@@ -2,7 +2,7 @@
 
 防止某个 IP / 来源 / API Key 高频打爆系统。实现固定窗口计数器:
     key = rate_limit:{scope}:{identity}:{window_bucket}
-    INCR + (首次)EXPIRE; 超过 limit 即拒绝, 返回需要等待的秒数。
+    Lua 原子 INCR + (首次)EXPIRE; 超过 limit 即拒绝, 返回需要等待的秒数。
 
 为什么用固定窗口而不是更精确的滑动窗口/令牌桶:
   - 实现简单、单次往返、足够挡住"刷接口"这类滥用;
@@ -22,6 +22,19 @@ from fastapi import HTTPException, Request
 from loguru import logger
 
 from app.config import settings
+
+
+# ---- Lua: 原子 "计数 + 首次设过期" ----
+# KEYS[1]=计数 key  ARGV[1]=window_sec
+# 拆成 INCR 再单独 EXPIRE 时, 并发首请求会各自拿到 count==1 都去 EXPIRE,
+# 窗口时长被反复重置甚至 (EXPIRE 丢失时) 永不过期。合进一个脚本保证原子。
+_HIT_LUA = """
+local n = redis.call('INCR', KEYS[1])
+if n == 1 then
+  redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1]))
+end
+return n
+"""
 
 
 async def _redis() -> Any | None:
@@ -55,10 +68,8 @@ async def hit(scope: str, identity: str, limit: int, window_sec: int) -> tuple[b
     bucket = now // window_sec
     key = f"rate_limit:{scope}:{identity}:{bucket}"
     try:
-        count = await client.incr(key)
-        if count == 1:
-            await client.expire(key, window_sec)
-        if int(count) > limit:
+        count = int(await client.eval(_HIT_LUA, 1, key, str(window_sec)))
+        if count > limit:
             retry_after = window_sec - (now % window_sec)
             return False, max(1, retry_after)
         return True, 0
