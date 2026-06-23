@@ -57,3 +57,6 @@ coverage/
 *.sqlite
 *.sqlite3
 *.db
+
+# Runtime state (PID files etc.)
+.run/
