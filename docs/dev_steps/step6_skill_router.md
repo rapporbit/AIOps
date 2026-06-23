@@ -158,9 +158,11 @@ class SkillChoice(BaseModel):
 
 > **面试话术**："Router 的设计原则是'宁可选错也不能不选'。LLM 路由失败时，我们有一个规则兜底——用关键词列表判断输入是不是运维问题。如果是，就放行到 generic_oncall 这个通用兜底剧本。generic_oncall 的工具集是通用只读集合，虽然不如专业 Skill 精准，但至少能跑完整个诊断流程。这样保证了即使 LLM 挂了，系统也不会卡在路由这一步。"
 
-### LLM Wiki 经验回灌
+### LLM Wiki 经验回灌（L1 目录级）
 
 Router 在调 LLM 之前，会从 LLM Wiki（经验库）召回与当前告警相关的历史诊断经验，注入到 Router 的 prompt 里。这样 Router 可以参考过去类似告警的处理经验来选择 Skill。
+
+按**渐进式披露**（详见 step14 §6），Router 默认只注入命中页的**目录行**（`recall_index_block()`，L1）——选 skill 不需要根因正文，把整页正文留到 Planner 阶段（L2）注入。这样 Router 的 prompt 更轻、也不会被大段正文带偏。需要时可用 `wiki_router_recall_level=full` 回退到旧的整页注入。
 
 回灌是 best-effort 的——召回失败不影响路由，只是少了一些参考信息。命中时会记一条 transition 事件，方便追溯"这次路由有没有用到经验回灌"。
 

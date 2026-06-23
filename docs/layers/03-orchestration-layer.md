@@ -15,9 +15,13 @@
     → 进入消费主循环
 
 消费主循环 (while not stopping):
-    1. claim_stale_tasks()        ← 先回收崩溃 Worker 的遗留任务
-    2. read_tasks(block=5000ms)   ← 两阶段优先级消费
-    3. handle_message(msg)        ← 执行诊断
+    try:
+        distributed_slot(wait=False)  ← 先抢全局并发槽, 拿到才读 stream
+        1. claim_stale_tasks()        ← 先回收崩溃 Worker 的遗留任务
+        2. read_tasks(block=5000ms)   ← 两阶段优先级消费
+        3. handle_message(msg)        ← 执行诊断 (槽已由主循环持有)
+    except DistributedLimitBusy:
+        sleep(0.5)                    ← 容量满: 不碰 stream, 短暂退避
 
 关闭序列:
     set stopping → cancel heartbeat → close MCP → close queue → close Postgres
@@ -26,6 +30,16 @@
 ### 消息处理流程
 
 ```python
+# 主循环: 并发槽前置到读取阶段
+while not stopping:
+    try:
+        async with distributed_slot("worker_diagnosis", limit=2, wait=False):
+            tasks = claim_stale() or read_tasks(block=5000ms)
+            for msg in tasks:
+                await handle_message(msg)
+    except DistributedLimitBusy:
+        await asyncio.sleep(0.5)
+
 async def handle_message(msg):
     # 1. 幂等检查: 已 succeeded 的任务直接 ACK 跳过
     if task.status == "succeeded":
@@ -35,18 +49,18 @@ async def handle_message(msg):
     if task.attempts >= max_attempts:
         await queue.dead_letter(msg, reason="max_attempts"); return
 
-    # 3. 标记 running, 递增 attempts
+    # 3. 标记 running (槽已由主循环持有, 状态不再虚标)
     await repo.mark_task_running(task_id)
 
-    # 4. 获取全局执行槽 (wait=True, 排队等待)
-    async with distributed_slot("worker_diagnosis", limit=2, wait=True):
-        # 5. 超时保护 (600s)
-        result = await asyncio.wait_for(run_diagnosis(...), timeout=600)
+    # 4. 超时保护 (1800s 墙钟, 含等人工审批时间)
+    result = await asyncio.wait_for(run_diagnosis(...), timeout=1800)
 
-    # 6. 成功: 更新状态 + ACK
+    # 5. 成功: 更新状态 + ACK
     await repo.mark_task_succeeded(task_id, report=result.report)
     await queue.ack(msg)
 ```
+
+**为什么把槽前置到读取阶段？** XREADGROUP 返回消息后就进入 PEL，如果此时容量满拿不到槽，消息堆在 PEL、状态虚标 running，还可能被其他 Worker 的 XAUTOCLAIM 回收导致双跑。改成"没容量就不碰 stream"，彻底消除这个竞态。
 
 ### 失败处理
 
@@ -117,8 +131,10 @@ return 0  -- token 已不存在
 
 | 模式 | 场景 | 行为 |
 |------|------|------|
-| `wait=False` | 同步 SSE 诊断 | 槽满直接拒绝，返回提示"请改用排队" |
-| `wait=True` | Worker 消费 | 每 0.5s 轮询等待，有序排队 |
+| `wait=False` | 同步 SSE 诊断 / Worker 主循环 | 槽满直接拒绝或退避，不占 PEL |
+| `wait=True` | 保留模式（当前未使用） | 每 0.5s 轮询等待，有序排队 |
+
+Worker 也改成了 `wait=False`：拿不到槽就 catch `DistributedLimitBusy` 短暂退避（0.5s），不去读 stream。
 
 ### Fail-Open
 

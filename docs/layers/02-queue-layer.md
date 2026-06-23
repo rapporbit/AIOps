@@ -98,7 +98,7 @@ Worker 崩溃后，已领取但未 ACK 的消息会留在 PEL (Pending Entries L
     → 交给当前 Worker 处理
 ```
 
-**15 分钟阈值**是关键：单次诊断超时上限 600 秒（10 分钟），加上安全边际，确保正在执行的任务不会被误回收。
+**15 分钟阈值**是关键：墙钟超时 1800 秒（30 分钟，含等人工审批时间），但实际诊断执行通常在 10 分钟以内，15 分钟阈值加上安全边际，确保正在执行的任务不会被误回收。
 
 ### 死信队列 (DLQ)
 
@@ -156,6 +156,21 @@ TTL: 30 秒
 | `diagnosis_worker_reclaim_idle_ms` | `900000` | Stale 回收阈值 (15min) |
 | `diagnosis_worker_reclaim_count` | `5` | 单次回收上限 |
 
+## 2.8 集成测试
+
+`tests/test_incident_queue.py` 用最小 FakeRedisStreams 复刻 Redis Streams 关键语义，不依赖真实 Redis：
+
+| 场景 | 验证点 |
+|------|--------|
+| 单流 FIFO + ACK | 先进先出、ACK 后移出 PEL 不重复投递 |
+| 多流严格优先级 | critical 先于 normal 先于 low（插队，非 FIFO） |
+| severity → level 推断 | enqueue 不传 level 时从 payload.severity 自动映射到正确流 |
+| 死信搬运 | DLQ 保留原始信息 + 在真实优先级流（非 base）上 ACK |
+| XAUTOCLAIM 回收 | idle 超阈值的 pending 被转交新 Worker |
+| 不误抢新鲜 pending | idle 未超阈值的在跑任务不被回收（防双跑） |
+
+FakeRedisStreams 的 `now_ms` 是可控时钟，测 xautoclaim 时把它往前推即可模拟消息空闲超阈值。
+
 ## 模拟面试问答
 
 ### 🔥 热点拷问
@@ -164,9 +179,9 @@ TTL: 30 秒
 
 开销很小。Phase 1 的非阻塞扫描是 4 次 XREADGROUP（count=1, block=0），每次返回几百字节，整个 Phase 1 在毫秒级。Phase 2 的 BLOCK 是 Redis 内核挂起，零 CPU。实际瓶颈完全不在这里——诊断任务的处理时间是 30-60 秒，队列消费速度不是瓶颈。
 
-**追问：你说 15 分钟回收阈值是"诊断超时 10 分钟 + 5 分钟安全边际"，那如果诊断真的跑了 14 分钟呢？**
+**追问：你说 15 分钟回收阈值，但墙钟超时是 30 分钟，那岂不是正在执行的任务会被误回收？**
 
-跑不到 14 分钟。10 分钟超时只计算真实执行时间（审批等待时 Pause 会停止计时）。超过 10 分钟的诊断会被 `asyncio.wait_for` 超时取消，任务标记失败并重新入队。XAUTOCLAIM 的 15 分钟阈值是兜底——只有 Worker 崩溃（没来得及 ACK）才需要它。正常情况下任务要么 10 分钟内完成，要么超时被取消。
+不会。墙钟超时 30 分钟是含人工审批等待的极端情况。审批等待时 Worker 调 `slot.pause()` 释放并发槽——此时任务不在"活跃执行"状态。实际诊断执行时间通常在 10 分钟以内。15 分钟阈值远大于实际执行时间，确保只有 Worker 真正崩溃（没来得及 ACK）的任务才会被回收。另外，并发槽已前置到读取阶段，Worker 只在持槽时才读消息，不会出现"读了消息但没容量跑"导致消息空闲超阈值的情况。
 
 ---
 

@@ -25,19 +25,24 @@ def _looks_like_oncall_input(query):
 
 明确非 OnCall 的输入（问天气、聊电影）在规则层直接拦截，不消耗 LLM 调用。
 
-### Level 2: LLM 分类 + Wiki 经验注入
+### Level 2: LLM 分类 + Wiki 经验注入（渐进式披露 L1）
 
 ```python
-# 从 LLM Wiki 召回相关经验
-recall_block = await wiki_store.recall_block(query, service=service)
+# L1 渐进式披露: Router 默认只注入命中页的"目录行"(轻量), 选 skill 不需要根因正文
+if settings.wiki_router_recall_level == "full":
+    lessons = await wiki_store.recall_block(query, signature=signature)      # 旧: 整页正文
+else:
+    lessons = await wiki_store.recall_index_block(query, signature=signature)  # 新: 仅目录行
 
-# 构建 Router 提示，注入历史经验
-messages = harness.build_skill_router_messages(query, skill_menu, recall_block)
+# 构建 Router 提示，注入历史经验目录
+messages = harness.build_skill_router_messages(query, skill_menu, lessons)
 
 # LLM 结构化输出
 choice: SkillChoice = await llm.with_structured_output(SkillChoice).ainvoke(messages)
 # SkillChoice: {skill_name: str, confidence: float, reason: str}
 ```
+
+**为什么 Router 只看目录？** 整页正文（现象/根因/处置 几百字）会让 Router 的 prompt 很重，且大段根因描述容易带偏选择——Router 只需要知道"有哪些历史经验可参考"就够了。正文留给 Planner 阶段注入（L2）。`wiki_router_recall_level=full` 可一键回退到旧行为。
 
 ### Level 3: 降级兜底
 
@@ -60,9 +65,9 @@ choice: SkillChoice = await llm.with_structured_output(SkillChoice).ainvoke(mess
 | `ROUTER_OUT_OF_SCOPE` | 非 OnCall，直接拒绝 |
 | `ROUTER_LLM_FAILED` | LLM 异常，走规则降级 |
 | `ROUTER_FALLBACK_GENERIC` | LLM 返回不存在的 Skill |
-| `ROUTER_RECALL_APPLIED` | Wiki 经验已注入 (附注入页数) |
+| `ROUTER_RECALL_APPLIED` | Wiki 经验已注入 (附注入条目数, L1 目录行或 L2 页数) |
 
-## Planner：Skill Playbook 种子规划
+## Planner：Skill Playbook 种子规划 + L2 经验注入
 
 Planner 不是从零生成计划，而是基于 Skill Playbook 做"种子 + 特化"：
 
@@ -75,6 +80,7 @@ Skill Playbook (Markdown):
 
 LLM Planner 输入:
     "你是运维诊断助手, 以下是排障剧本: {playbook}
+     {lessons_section}        ← L2: 历史经验正文 (若有)
      当前故障: {query}
      请生成 2-3 步诊断计划"
 
@@ -82,6 +88,10 @@ LLM Planner 输入:
 ```
 
 Playbook 约束了计划的方向和工具范围，LLM 只在框架内做特化，减少不着边际的诊断计划。
+
+### L2 渐进式披露：Planner 注入历史经验正文
+
+Router 只看了目录（L1），Planner 阶段才注入命中页的**整页正文**（现象/根因/处置）。选页逻辑与 L1 共用 `_select_pages`，注入上限 `wiki_planner_recall_max_chars=2500`。命中时记 `PLANNER_RECALL_APPLIED` transition。`wiki_planner_recall_enabled=false` 可关闭。
 
 ## Skill 注册表
 
@@ -141,7 +151,7 @@ platforms: [macos, linux]
 
 **追问：Skill Router 的分类准确率多少？有测过吗？**
 
-没有系统性的分类准确率评测，该补。定性观察：规则预检层对明显场景基本 100% 准确（关键词硬匹配）；LLM 分类层在语义明确场景下也比较稳。不确定的场景（"服务响应慢"可能是网络也可能是资源）是分类错误高发区，但 Replanner 重路由可以纠正。应该建一组 100+ 的分类评测集，覆盖明确场景、模糊场景和边界 case，量化 precision/recall。
+有。`scripts/eval_router.py` + `benchmark/router_skill_16.jsonl` 提供了 16 题的 Skill Router 评测集（覆盖 host/network/container/generic + 域外拒绝），默认 A/B 对比 `wiki_router_recall_level=full` vs `index`。实测 full 和 index 两种模式均 16/16 零回归，说明 L1 目录级回灌不影响路由准确率。后续应扩展到 100+ 题覆盖更多模糊场景。
 
 ### 深度追问链
 
@@ -171,4 +181,4 @@ platforms: [macos, linux]
 
 **面试官：Skill 设计最成功和最后悔的决策？**
 
-最成功："只读工具自动豁免 Skill 白名单"——一条规则让所有 Skill 都能用 `search_knowledge_base`，不需要重复列出。最后悔：没有早点做 Skill Router 分类评测——很多设计决策（关键词列表、Prompt 措辞）都凭直觉调，没有数据支撑。如果一开始就建了评测集，迭代效率会高很多。
+最成功："只读工具自动豁免 Skill 白名单"——一条规则让所有 Skill 都能用 `search_knowledge_base`，不需要重复列出。另一个得意决策是 Wiki 经验回灌的渐进式披露——Router 只看目录、Planner 读正文、Executor 按需钻取，16 题 A/B 对比验证零回归。教训：应该更早建 Router 评测集——渐进式披露这样的重构必须有评测兜底，如果一开始就有评测集，迭代效率会高很多。

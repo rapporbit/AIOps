@@ -35,6 +35,7 @@ def evaluate_budget(stats):
 - **SRE 人格**："你是一个经验丰富的 SRE，优先用工具取证而不是猜测"
 - **报告模板**：5 段式（问题概述、已收集证据、根因分析、处置建议、结论）
 - **重路由规则**：切换条件、证据要求、配额限制
+- **渐进式披露模板**：Router 收到的是"历史经验目录"（L1），Planner 收到的是"历史处置经验正文"（L2）——两套模板措辞不同，引导 LLM 以合适的方式使用回灌信息
 
 ## 状态管理
 
@@ -70,6 +71,10 @@ evidences: Annotated[List[Dict], operator.add]  # 并行安全累积
 每个节点执行后追加 `StateTransition`：
 
 ```python
+{"node": "planner", "reason": "PLANNER_RECALL_APPLIED",
+ "detail": "注入 2 个历史经验页正文",
+ "ts": "2024-01-15T10:30:00.100"}
+
 {"node": "replanner", "reason": "REPLANNER_REROUTE",
  "detail": "network_diagnosis → host_resource_diagnosis, 证据不足阻止",
  "ts": "2024-01-15T10:30:00.123"}

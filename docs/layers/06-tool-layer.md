@@ -21,7 +21,7 @@
 ### 工具加载优先级
 
 ```
-1. 本地工具 (search_knowledge_base, get_current_time, ...)
+1. 本地工具 (search_knowledge_base, get_current_time, read_wiki_page, ...)
 2. MCP 工具 (从各 MCP Server 动态加载)
 3. 子 Agent 工具 (delegate_to_evidence_collector, ...)
 
@@ -58,6 +58,20 @@ async def search_knowledge_base(query: str) -> str:
 ```
 
 RAG 检索能力包装为标准 LangChain `@tool`，对 Agent 来说和其他 MCP 工具没有区别。
+
+### Wiki 钻取工具（L3 渐进式披露）
+
+```python
+# app/tools/wiki_tools.py
+@tool
+def read_wiki_page(ref: str) -> str:
+    """按引用读取一篇事故知识 Wiki 页 (历史诊断沉淀的现象/根因/处置)。"""
+    return wiki_store.read_wiki_page(ref)
+```
+
+Planner 注入的历史经验正文（L2）中会出现 `[[services/redis]]`、`[[patterns/redis-oom]]` 互链。Agent 判断需要时用此工具按需拉取关联页（L3），而不是预先把整张 wiki 图塞进 prompt。
+
+**安全设计**：双重路径穿越防御——正则白名单 `^(services|patterns)/<slug>$` 拒绝 `..`/绝对路径/额外 `/`；`resolve().relative_to(_WIKI_DIR)` 二次确认解析后仍在 wiki 目录内。只读工具，由 `tool_filter` 的 auto-readonly 对全 Skill 自动放行，`wiki_page_tool_enabled=true` 控制开关。
 
 ## 6.2 三层工具过滤
 

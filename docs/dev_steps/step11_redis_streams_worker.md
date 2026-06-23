@@ -88,21 +88,28 @@ Worker 的 `read_tasks()` 消费策略：
 
 ## 2. Worker 消费循环
 
-### 核心循环
+### 核心循环（槽前置模式）
 
 ```python
 while not stopping:
-    # Step 1: 先回收崩溃 Worker 的 stale pending 任务
-    tasks = await claim_stale_tasks_once()
+    try:
+        # Step 0: 先抢全局并发槽 (wait=False), 拿到才去读 stream
+        async with distributed_slot("worker_diagnosis", limit=2, wait=False):
+            # Step 1: 先回收崩溃 Worker 的 stale pending 任务
+            tasks = await claim_stale_tasks_once()
 
-    # Step 2: 没有 stale → 读新任务（按优先级）
-    if not tasks:
-        tasks = await read_tasks(consumer_name, count=1, block_ms=5000)
+            # Step 2: 没有 stale → 读新任务（按优先级）
+            if not tasks:
+                tasks = await read_tasks(consumer_name, count=1, block_ms=5000)
 
-    # Step 3: 处理任务
-    for message_id, item in tasks:
-        await handle_message(message_id, item)
+            # Step 3: 处理任务
+            for message_id, item in tasks:
+                await handle_message(message_id, item)
+    except DistributedLimitBusy:
+        await asyncio.sleep(0.5)  # 容量满: 不碰 stream, 短暂退避
 ```
+
+**为什么把并发槽前置到读取阶段？** 之前是先 XREADGROUP 读消息，再在 handle_message 里抢槽。问题是 XREADGROUP 一旦返回消息就进入了该 Worker 的 PEL（Pending Entries List），如果此时容量满拿不到槽，消息会堆在 PEL、状态虚标 running，还可能被其他 Worker 的 XAUTOCLAIM 回收导致双跑。改成"没容量就不碰 stream"，起再多 Worker 也只是多几个退避轮询者。
 
 为什么每轮先 reclaim 再读新？
 
@@ -131,24 +138,27 @@ while not stopping:
 
 ### 解决方案
 
-用 Redis 实现分布式并发槽（`distributed_slot`），所有 Worker 共享同一个全局上限：
+用 Redis 实现分布式并发槽（`distributed_slot`），所有 Worker 共享同一个全局上限。槽前置到读取阶段——先抢槽再读 stream：
 
 ```python
-async with distributed_slot(
-    "worker_diagnosis",
-    limit=settings.worker_diagnosis_concurrency,  # 默认 2
-    ttl_seconds=...,
-    refresh_interval_seconds=...,
-    wait=True,  # Worker 路径等待排队
-):
-    result = await asyncio.wait_for(
-        run_legacy_langgraph_with_audit(task_id, item),
-        timeout=settings.diagnosis_task_timeout_sec,
-    )
+# 主循环: 槽前置
+while not stopping:
+    try:
+        async with distributed_slot(
+            "worker_diagnosis",
+            limit=settings.worker_diagnosis_concurrency,  # 默认 2
+            ttl_seconds=...,
+            refresh_interval_seconds=...,
+            wait=False,  # 拿不到立刻退避
+        ):
+            tasks = claim_stale() or read_tasks(block=5000ms)
+            for msg in tasks:
+                await handle_message(msg)  # 槽已由主循环持有
+    except DistributedLimitBusy:
+        await asyncio.sleep(0.5)  # 容量满: 不碰 stream
 ```
 
-`wait=True`（Worker）：槽满了等待，不拒绝——任务天然在队列里排队。
-`wait=False`（SSE 直连）：槽满了立刻拒绝，返回"请改用提交排队"。
+`wait=False`（Worker + SSE）：槽满了不碰 stream / 直接拒绝。Worker 短暂退避后重试，SSE 直接返回"请改用提交排队"。
 
 ### 槽的实现
 
@@ -161,7 +171,7 @@ async with distributed_slot(
 
 ### 面试话术
 
-> "并发控制用 Redis 分布式槽，不是进程内 Semaphore。不管起多少个 Worker，真正在跑的诊断不会超过全局上限。Worker 路径 wait=True 排队等位，SSE 路径 wait=False 满了直接拒绝引导用户排队。槽带 TTL 和心跳续期，进程崩了不会永久占位。"
+> "并发控制用 Redis 分布式槽，不是进程内 Semaphore。不管起多少个 Worker，真正在跑的诊断不会超过全局上限。槽前置到读取阶段——先抢槽再读 stream（wait=False），拿不到就退避不碰消息，避免消息堆在 PEL 被误回收双跑。SSE 路径同样 wait=False 满了直接拒绝引导用户排队。槽带 TTL 和心跳续期，进程崩了不会永久占位。"
 
 ---
 
@@ -210,7 +220,7 @@ tasks = await claim_stale_tasks(
 
 **为什么 min_idle_ms 要 15 分钟这么长？**
 
-> "诊断任务本身可能跑 5-10 分钟（deep 模式更久）。如果 idle 阈值太短（比如 2 分钟），正常运行中的长任务会被另一个 Worker 误回收，导致同一个任务被两个 Worker 同时执行。15 分钟 >> 单次诊断超时时间（10 分钟），确保只有真正崩溃的任务才会被回收。"
+> "诊断任务本身可能跑 5-10 分钟（deep 模式更久），墙钟超时设的是 30 分钟（含等人工审批时间）。如果 idle 阈值太短（比如 2 分钟），正常运行中的长任务会被另一个 Worker 误回收，导致同一个任务被两个 Worker 同时执行。15 分钟阈值远大于实际诊断执行时间（通常 10 分钟以内），确保只有真正崩溃的任务才会被回收。"
 
 ---
 
@@ -253,7 +263,28 @@ DLQ 的消息不会被自动处理。人工排查后可以选择：
 
 ---
 
-## 7. 为什么选 Redis Streams 而不是 Celery/RabbitMQ
+## 7. 集成测试覆盖
+
+队列是 Worker 崩溃恢复与防重复执行的正确性根基，用一个最小 `FakeRedisStreams` 复刻 Redis Streams 的关键语义（xadd / xreadgroup / xack / xautoclaim + consumer group + PEL），覆盖以下场景：
+
+| 测试场景 | 验证点 |
+|---|---|
+| 单流 FIFO 读取 + ACK | 先进先出、ACK 后不重复投递 |
+| 多流严格优先级插队 | critical 先于 normal 先于 low |
+| severity → level 推断 | enqueue 不传 level 时从 payload.severity 自动映射 |
+| 死信队列搬运 | DLQ 保留原始信息 + ACK 原消息（在其真实优先级流上） |
+| XAUTOCLAIM 回收崩溃 Worker | idle 超阈值的 pending 被转交 |
+| 不抢新鲜 pending | idle 未超阈值的正在跑任务不会被误回收 |
+
+不依赖真实 Redis 或 pytest-asyncio，沿用本仓库 `asyncio.run` 跑法。FakeRedisStreams 的 `now_ms` 是可控时钟，测 xautoclaim 时把它往前推即可模拟消息空闲超阈值。
+
+### 面试话术
+
+> "队列模块有完整的集成测试，用 FakeRedisStreams 复刻了 Stream/Consumer Group/PEL 语义。覆盖了 FIFO 投递、多流优先级插队、死信搬运、XAUTOCLAIM 回收和不误抢正在跑的任务。不需要真实 Redis，但验证的是 Worker 崩溃恢复和防重复执行的正确性。"
+
+---
+
+## 8. 为什么选 Redis Streams 而不是 Celery/RabbitMQ
 
 这是面试高频追问。
 
@@ -270,7 +301,7 @@ DLQ 的消息不会被自动处理。人工排查后可以选择：
 
 ---
 
-## 8. 遇到的难点总结
+## 9. 遇到的难点总结
 
 ### 难点 1：重试时消息重复
 
@@ -284,7 +315,13 @@ DLQ 的消息不会被自动处理。人工排查后可以选择：
 
 解决方案：`distributed_slot` 内部启动一个心跳续期 loop，每 N 秒刷新 TTL。TTL 初始值设长（比如 120 秒），心跳间隔设短（比如 30 秒），正常运行时永远不过期。进程崩了才会在 TTL 后自动释放。
 
-### 难点 3：Worker 启动时 MCP 偶发失败
+### 难点 3：先读后抢槽导致 PEL 堆积和双跑
+
+最初 Worker 的逻辑是先 XREADGROUP 读消息、再在 handle_message 里抢并发槽。问题是 XREADGROUP 返回消息后就进了当前 Worker 的 PEL，如果此时全局槽满（比如其他 Worker 正在跑），消息堆在 PEL 且状态已虚标 running，其他 Worker 的 XAUTOCLAIM 看到 idle 超阈值后会回收这些消息，导致同一任务被两个 Worker 同时执行。
+
+解决方案：把并发槽前置到读取阶段——先抢槽（`wait=False`），拿到才读 stream；拿不到就短暂退避，不碰 stream。这样起再多 Worker，真正从 stream 拉消息的永远不超过全局槽上限。
+
+### 难点 4：Worker 启动时 MCP 偶发失败
 
 Worker 是独立进程，启动时也要连 MCP Server。但 Worker 可能比 MCP Server 先启动。
 
@@ -298,11 +335,12 @@ Worker 是独立进程，启动时也要连 MCP Server。但 Worker 可能比 MC
 |---|---|---|
 | 优先级队列 | 四级 Stream + 严格插队消费 | 多 Stream 模式、兼容旧 base stream |
 | Worker 循环 | 先 reclaim 再读新 + 四层校验 | 幂等保护、attempts 检查 |
-| 全局并发槽 | Redis 分布式 INCR/DECR + TTL + 心跳 | 跨 Worker 共享、wait=True/False 两模式 |
+| 全局并发槽 | Redis 分布式 INCR/DECR + TTL + 心跳 | 跨 Worker 共享、槽前置到读取阶段 |
 | Heartbeat | TTL key + 定期刷新 | 判断 Worker 存活、30s 过期 |
 | Pending 回收 | XAUTOCLAIM + 15min idle | 崩溃恢复、不误回收长任务 |
 | 重试 | XADD 新消息 + ACK 旧消息 | 保持原优先级、不阻塞队首 |
 | DLQ | 独立 Stream + 原始信息保留 | 不丢数据、人工排查 |
+| 集成测试 | FakeRedisStreams 复刻关键语义 | FIFO/优先级/DLQ/XAUTOCLAIM/不误抢 |
 
 ---
 

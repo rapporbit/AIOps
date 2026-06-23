@@ -212,30 +212,39 @@ LLM 挂了就退化成简单的追加——信息不会丢失，只是没有"合
 
 ---
 
-## 6. 读取：recall_block（read-index-first）
+## 6. 读取：渐进式披露（L1/L2/L3）
 
-### 触发时机
+借鉴 Claude Skill 的**渐进式披露（progressive disclosure）**：把"一次性整页注入"拆成三层按需加载，每层注入到它真正有用的节点，让 Router 不被大段正文带偏、也省 token。三层共用同一套 read-index-first 选页逻辑（`_select_pages`）。
 
-每次诊断开始前（Router/Planner prompt 构建时），调 `recall_block()` 注入历史经验。
+| 层 | 注入节点 | 内容 | 函数 | 开关 |
+|---|---|---|---|---|
+| **L1 目录** | Router | 命中页的目录行（`- [[ref]] — 摘要`） | `recall_index_block()` | `wiki_router_recall_level=index`（默认） |
+| **L2 正文** | Planner | 命中页的整页正文（现象/根因/处置） | `recall_block()` | `wiki_planner_recall_enabled=true` |
+| **L3 钻取** | Executor | 按 `[[链接]]` 拉单页 | `read_wiki_page()` 工具 | `wiki_page_tool_enabled=true` |
 
-### 召回策略：read-index-first
+核心思想：**Router 看目录、Planner 读正文、Executor 才按链接钻**——而不是开局把整页正文全塞给只负责选 skill 的 Router。Router 可用 `wiki_router_recall_level=full` 一键回退到旧的整页注入行为。
+
+### 选页策略：read-index-first（L1/L2 共用）
 
 ```
 Step 1: 直达页
     从告警签名提取 service 和 pattern
-    如果 services/{service}.md 和 patterns/{pattern}.md 存在 → 直接读
+    如果 services/{service}.md 和 patterns/{pattern}.md 存在 → 直接选中
 
 Step 2: 兜底 — 读 index 关键词匹配
     如果没有直达页 → 读 index.md
     把 query 和 index 每行做关键词重叠打分
-    取 top-2 相关页读取
+    取 top-2 相关页
 
-输出: 拼成 markdown 注入块（≤2000 字），注入 Router/Planner 的 prompt
+L1 输出: 选中页的 index 目录行（轻量，给 Router）
+L2 输出: 选中页的整页正文拼成 markdown 注入块（≤2000/2500 字，给 Planner）
 ```
 
 为什么不用 Embedding 向量检索？
 
 > "wiki 的页面数量很少（几十页），用向量检索是大炮打蚊子。关键词匹配加 read-index-first 就够了，零额外依赖。而且直达页是最精确的——告警签名直接映射到 pattern slug，不需要语义理解。"
+
+L3 的 `read_wiki_page()` 接收 LLM 生成的 ref，是任意读入口，做了**双重防御**：正则白名单 `^(services|patterns)/<slug>$`（拒 `..`/绝对路径/额外 `/`）+ `resolve().relative_to(_WIKI_DIR)` 二次确认落点仍在 wiki 目录内。只读工具，由 `tool_filter` 的 auto-readonly 自动对全 Skill 放行，无需改 SKILL.md。
 
 ---
 
@@ -304,7 +313,8 @@ Wiki 内容注入到 prompt 里会占 token。如果 Redis 服务页写了 5000 
 | low-scores API | 低分题精确定位 | 闭环可操作、"补哪些语料" |
 | 压测 | loadtest.py 6 场景 | 数据见 Step 12 |
 | Wiki 写入 | LLM 合并 + 确定性兜底 | 合并而非追加、best-effort |
-| Wiki 读取 | read-index-first + 关键词匹配 | 直达页优先、不依赖 Embedding |
+| Wiki 读取 | L1 目录/L2 正文/L3 钻取 + read-index-first | 渐进式披露、每层独立开关 |
+| Router 评测 | 16 题 × A/B 对比 (full vs index) | 路由零回归、eval_router.py |
 | Wiki 并发 | asyncio.Lock + fcntl | 双重锁 |
 | Wiki lint | 孤页/未索引/空页检查 | 确定性、不调 LLM |
 
