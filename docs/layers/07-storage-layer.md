@@ -293,7 +293,7 @@ async with conn.begin():
 
 **追问：增量同步具体怎么做？文档更新后旧的 chunk 怎么处理？全量重建索引吗？**
 
-文档级增量：当一个文档更新时，按 `source` 字段删除该文档所有旧 chunk，重新分块后写入新 chunk。Milvus 支持按字段删除，所以可以做到文档级粒度，不需要全量重建。BM25 索引需要调用 `refresh_bm25_index()` 重建，目前是全量重建，但因为在内存里所以几秒就完成。如果知识库规模到了几十万 chunk，BM25 可以考虑迁移到 Milvus 的 Sparse Vector 或独立的倒排索引服务。
+文档级增量：当一个文档更新时，按 `source` 字段 `DELETE FROM kb_chunks WHERE source = $1` 删掉该文档所有旧 chunk，重新分块后写入新 chunk，做到文档级粒度，不需要全量重建。向量(pgvector HNSW)和 BM25(ParadeDB pg_search)两个索引都**随 INSERT/DELETE 自动维护**，不需要任何手动 `refresh`——这正是把 BM25 从进程内存 `rank_bm25` 迁到 pg_search 后的好处：旧版内存 BM25 每次变更要全量重建、且每个进程各建一份，现在 DB 侧单份共享、即时生效，到几十万 chunk 也不再有内存/重建瓶颈。
 
 ---
 

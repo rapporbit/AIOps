@@ -82,18 +82,64 @@ class Settings(BaseSettings):
         description="Ollama embedding HTTP 调用超时秒数",
     )
 
-    # ==================== Milvus 向量数据库 ====================
-    milvus_host: str = Field(default="localhost", description="Milvus 主机")
-    milvus_port: int = Field(default=19530, description="Milvus 端口")
-    milvus_collection: str = Field(default="multi_agent_kb", description="Collection 名")
-    milvus_timeout_ms: int = Field(default=10000, description="连接超时 (毫秒)")
-    milvus_hnsw_search_ef: int = Field(
+    # ==================== pgvector 向量数据库 ====================
+    # 向量库已从 Milvus 迁到 pgvector, 复用下方 database_url 的同一个 Postgres 实例,
+    # 表为 kb_chunks (见 app/core/pg_vector_store.py)。维度由 embedding 模型决定 (默认 1024)。
+    pgvector_table: str = Field(default="kb_chunks", description="向量库表名")
+    pgvector_hnsw_m: int = Field(default=16, description="HNSW 图每层最大连接数 (建索引时)")
+    pgvector_hnsw_ef_construction: int = Field(
+        default=64, description="HNSW 建索引时的候选数, 越大索引越准越慢"
+    )
+    pgvector_hnsw_ef_search: int = Field(
         default=128,
         description=(
-            "HNSW 查询时 ef 参数, 必须大于等于实际搜索 top-k. "
-            "只影响查询召回/延迟, 不需要重建索引."
+            "HNSW 查询时 ef_search, 必须 >= 实际 top-k. "
+            "只影响查询召回/延迟, 不需要重建索引 (每查询用 SET LOCAL 生效)."
         ),
     )
+    # BM25 (ParadeDB pg_search): 词法检索从内存 rank_bm25 迁到 DB 侧 pg_search,
+    # 索引随写入自动维护, 无内存截断/多进程各建一份问题。分词器决定中英文切分方式:
+    #   chinese_compatible = 中文按字 (与原内存 BM25 行为一致, 最稳)
+    #   chinese_lindera    = 中文按词 (更准, 需重跑评测确认)
+    kb_bm25_tokenizer: str = Field(
+        default="chinese_compatible",
+        description="pg_search BM25 分词器: chinese_compatible / chinese_lindera / icu / jieba",
+    )
+
+    # ==================== MinerU 文档解析 (官方在线 API) ====================
+    # 把 pdf/doc(x)/ppt(x)/图片/html 归一化成 Markdown, 复用现有 splitter。
+    # 无 fallback: 解析失败即报错拒收 (上传返回 503, 同步标记 failed 下轮重试)。
+    # 流程: file-urls/batch 申请预签名上传链接 → PUT 上传 → 轮询 batch 结果 → 下载 zip 取 full.md。
+    mineru_api_base: str = Field(default="https://mineru.net", description="MinerU API 根地址")
+    mineru_token: str = Field(default="", description="MinerU API Token (空则拒绝一切解析)")
+    mineru_model_version: str = Field(
+        default="vlm", description="解析后端: pipeline / vlm / MinerU-HTML"
+    )
+    mineru_enable_formula: bool = Field(default=True, description="启用公式识别 (→LaTeX)")
+    mineru_enable_table: bool = Field(default=True, description="启用表格识别 (→HTML)")
+    mineru_language: str = Field(default="ch", description="OCR 语言, 默认中英 ch")
+    mineru_poll_interval_sec: float = Field(default=3.0, description="轮询任务结果间隔秒")
+    mineru_timeout_sec: float = Field(default=300.0, description="单文档解析总超时秒")
+    mineru_max_bytes: int = Field(
+        default=200 * 1024 * 1024, description="提交前文件大小上限 (MinerU 200MB)"
+    )
+
+    # ==================== 飞书 (Lark) 数据源 ====================
+    # 企业自建应用: App ID + App Secret 换 tenant_access_token 访问云文档/知识库。
+    # ⚠️ 还需在飞书把应用加为目标 Wiki/文件夹的"文档应用/协作者", 否则列表为空。
+    feishu_app_id: str = Field(default="", description="飞书自建应用 App ID")
+    feishu_app_secret: str = Field(default="", description="飞书自建应用 App Secret (密钥)")
+    feishu_api_base: str = Field(
+        default="https://open.feishu.cn", description="飞书开放平台根地址"
+    )
+    feishu_timeout_sec: float = Field(default=30.0, description="飞书 API 调用超时秒")
+    feishu_export_timeout_sec: float = Field(
+        default=120.0, description="飞书文档导出 (export_task) 总超时秒"
+    )
+
+    # ==================== 知识库同步调度 ====================
+    kb_sync_enabled: bool = Field(default=True, description="启用定时同步调度器")
+    kb_sync_interval_sec: int = Field(default=1800, description="各数据源同步轮询间隔秒 (默认30min)")
 
     # ==================== RAG 基础 ====================
     # Parent-Child 切分: rag_chunk_size 是 child 块大小 (embedding 用, 小=召回准);
@@ -179,8 +225,12 @@ class Settings(BaseSettings):
         description="Worker heartbeat key 的 TTL 秒数, 过期表示该 Worker 可能已经退出.",
     )
     diagnosis_task_timeout_sec: int = Field(
-        default=600,
-        description="单个诊断任务最大运行秒数. 超时后进入 retry 或 DLQ, 避免任务永久占用 Worker.",
+        default=1800,
+        description=(
+            "单个诊断任务的墙钟超时秒数 (含等人工审批的时间). 必须 > 单次工作耗时 + 审批耗时 "
+            "(approvals_timeout_sec), 否则等审批时会被腰斩; 默认 30 分钟. "
+            "超时后进入 retry 或 DLQ, 避免任务永久占用 Worker."
+        ),
     )
     diagnosis_task_max_attempts: int = Field(
         default=3,

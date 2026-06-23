@@ -4,8 +4,8 @@
   - dashscope: 默认, 使用 text-embedding-v4
   - ollama: 本地 Ollama, 推荐 bge-m3
 
-两种后端都实现 LangChain Embeddings 接口, 所以上层 Milvus/RAG 逻辑不用改。
-切换 embedding 模型后必须重建 Milvus collection, 不能混用旧向量。
+两种后端都实现 LangChain Embeddings 接口, 所以上层 pgvector/RAG 逻辑不用改。
+切换 embedding 模型 (尤其维度变化) 后必须重建 kb_chunks 表并重灌, 不能混用旧向量。
 """
 
 from functools import lru_cache

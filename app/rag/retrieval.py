@@ -4,7 +4,7 @@
 services/rag_service 都从这里取, 避免 tools 反向 import services 的反向依赖。
 
 Parent-Child 流程:
-  1. advanced_search 在 Milvus 上找最相似的 child 小块 (top_k 多取一些, 给去重留余量)
+  1. advanced_search 在 pgvector 上找最相似的 child 小块 (top_k 多取一些, 给去重留余量)
   2. 按 parent_id 去重: 同一个 parent 下多个 child 命中, 只算一次 (取最高分)
   3. 用 parent_content 拼 context 返回 (而不是 child page_content) → LLM 拿到完整段落
 

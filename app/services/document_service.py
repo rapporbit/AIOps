@@ -1,27 +1,80 @@
 """文档管理服务: 上传 / 列表 / 删除.
 
 设计要点:
-  - 上传: 读文件 → 分块 (core/splitter) → 写入 Milvus (langchain_milvus)
-  - 列表: 通过 collection.query 拉取所有 metadata, 按 source 字段聚合
-  - 删除: 用 expr 表达式按 source 字段过滤删除
+  - 上传: 读文件 → (md/txt 直通 | 其他格式经 MinerU 解析成 markdown) → 分块 → 幂等写入 pgvector
+  - 列表: 按 source 字段聚合 chunk 数
+  - 删除: 按 source 字段删除所有相关 chunk
+  - 解析无 fallback: MinerU 失败即抛 DocumentParseError (HTTP 503), 不入库, 稍后重试
 """
 
-from typing import Dict, List
+from typing import List
 
 from fastapi import UploadFile
 from loguru import logger
 
 from app.config import settings
-from app.core.milvus import milvus_manager
+from app.core import pg_vector_store
+from app.core.parsers import ParseError, mineru_parser
 from app.core.splitter import split_markdown
-from app.core.vector_store import get_vector_store
 from app.exceptions import (
+    DocumentParseError,
     UnsupportedFileTypeError,
     VectorStoreError,
 )
 from app.schemas.document import DocumentInfo, UploadResponse
 
-ALLOWED_EXTENSIONS = {".md", ".markdown", ".txt"}
+# md/txt 直通 (本身就是文本, 无需解析)
+TEXT_EXTENSIONS = {".md", ".markdown", ".txt"}
+# 走 MinerU 解析的格式; 值 = 默认是否需要 OCR (图片/扫描件 True, 原生文本 False)
+MINERU_EXTENSIONS = {
+    ".pdf": False,
+    ".doc": False,
+    ".docx": False,
+    ".ppt": False,
+    ".pptx": False,
+    ".html": False,
+    ".png": True,
+    ".jpg": True,
+    ".jpeg": True,
+    ".bmp": True,
+    ".gif": True,
+}
+ALLOWED_EXTENSIONS = TEXT_EXTENSIONS | set(MINERU_EXTENSIONS)
+
+
+# ============================================================
+# 归一化: 任意格式字节 → markdown (上传 / 同步引擎共用)
+# ============================================================
+async def normalize_to_markdown(
+    raw: bytes, filename: str, *, need_ocr: bool | None = None
+) -> str:
+    """把文件字节归一化成 markdown 文本。
+
+    - .md/.markdown/.txt: 直接按 UTF-8 解码
+    - 其他受支持格式: 经 MinerU 解析 (need_ocr 不传则按扩展名默认)
+
+    Raises:
+        UnsupportedFileTypeError: 空文件 / 编码错误 / 不支持的扩展名 / 过大 (客户端错误)
+        ParseError: MinerU 解析失败 (由调用方决定转 503 还是标记 failed)
+    """
+    if not raw:
+        raise UnsupportedFileTypeError("文件为空")
+    ext = _get_extension(filename)
+    if ext in TEXT_EXTENSIONS:
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError as e:
+            raise UnsupportedFileTypeError(f"文件不是 UTF-8 编码: {e}") from e
+    if ext in MINERU_EXTENSIONS:
+        if len(raw) > settings.mineru_max_bytes:
+            raise UnsupportedFileTypeError(
+                f"文件过大 ({len(raw)} 字节), 超过上限 {settings.mineru_max_bytes}"
+            )
+        ocr = MINERU_EXTENSIONS[ext] if need_ocr is None else need_ocr
+        return await mineru_parser.to_markdown(raw, filename=filename, need_ocr=ocr)
+    raise UnsupportedFileTypeError(
+        f"不支持的文件类型 '{ext}', 支持 {sorted(ALLOWED_EXTENSIONS)}"
+    )
 
 
 # ============================================================
@@ -40,39 +93,33 @@ async def upload_document(file: UploadFile) -> UploadResponse:
     raw = await file.read()
     if not raw:
         raise UnsupportedFileTypeError("文件为空")
-
-    try:
-        content = raw.decode("utf-8")
-    except UnicodeDecodeError as e:
-        raise UnsupportedFileTypeError(f"文件不是 UTF-8 编码: {e}") from e
-
     bytes_count = len(raw)
     logger.info(f"[document] 收到上传: {filename} ({bytes_count} bytes)")
+
+    # 归一化成 markdown (md/txt 直通, 其他经 MinerU)。解析失败 → 503 拒收, 不入库。
+    try:
+        content = await normalize_to_markdown(raw, filename)
+    except ParseError as e:
+        logger.warning(f"[document] MinerU 解析失败 {filename}: {e}")
+        raise DocumentParseError(detail=str(e)) from e
 
     # 分块
     chunks = split_markdown(content, source=filename)
     if not chunks:
         raise UnsupportedFileTypeError(f"文件 {filename} 切分后无有效内容")
 
-    # 写入向量库
+    # 写入向量库: 用 doc_id 幂等替换 (同名再传会先删旧 chunk, 不再重复堆积)。
+    # 本地直传的稳定 doc_id 约定 = 'local:'+文件名, 与建表时的存量回填一致。
+    doc_id = f"local:{filename}"
     try:
-        vs = get_vector_store()
-        vs.add_documents(chunks)
+        await pg_vector_store.replace_doc(doc_id, chunks)
     except Exception as e:
         logger.exception(f"[document] 写入向量库失败: {e}")
         raise VectorStoreError(f"向量库写入失败: {e}") from e
 
     logger.info(f"[document] {filename}: 索引 {len(chunks)} 个 chunk")
 
-    # 若启用 Hybrid Search, 上传后立刻重建 BM25 索引
-    # 为什么放在这里: 保证下一次 RAG 查询就能用新文档; 失败不阻断上传
-    if settings.rag_hybrid_enabled and settings.rag_bm25_refresh_on_upload:
-        try:
-            from app.core.hybrid_retriever import refresh_bm25_index
-
-            refresh_bm25_index()
-        except Exception as e:
-            logger.warning(f"[document] BM25 刷新失败 (忽略): {type(e).__name__}: {e}")
+    # BM25 走 ParadeDB pg_search, 索引随 INSERT 自动维护, 无需手动刷新。
 
     return UploadResponse(
         source=filename,
@@ -84,88 +131,35 @@ async def upload_document(file: UploadFile) -> UploadResponse:
 # ============================================================
 # 列表
 # ============================================================
-def list_documents() -> List[DocumentInfo]:
+async def list_documents() -> List[DocumentInfo]:
     """列出所有已索引的文档 (按 source 聚合)."""
-    if not milvus_manager.has_collection():
-        return []
-
-    try:
-        from pymilvus import Collection
-
-        col = Collection(settings.milvus_collection)
-        col.load()
-
-        # 查所有记录的 source 字段 (langchain_milvus 把 metadata 存为 JSON 字段)
-        # 对于较大的 collection 这会很慢, 生产环境应该用单独的元数据表
-        results = col.query(
-            expr="pk >= 0",  # 全表
-            output_fields=["source"],  # 只要 source
-            limit=16384,  # Milvus 单次 query 上限
-        )
-
-    except Exception as e:
-        logger.warning(f"[document] 查询文档列表失败: {e}")
-        return []
-
-    # 聚合
-    counter: Dict[str, int] = {}
-    for row in results:
-        source = row.get("source") or "unknown"
-        counter[source] = counter.get(source, 0) + 1
-
-    return sorted(
-        [DocumentInfo(source=k, chunk_count=v) for k, v in counter.items()],
-        key=lambda d: d.source,
-    )
+    sources = await pg_vector_store.list_sources()
+    return [DocumentInfo(source=src, chunk_count=cnt) for src, cnt in sources]
 
 
 # ============================================================
 # 删除
 # ============================================================
-def delete_document(source: str) -> int:
+async def delete_document(source: str) -> int:
     """按 source 删除所有相关 chunks.
 
     Returns:
         删除的 chunk 数量
     """
-    if not milvus_manager.has_collection():
-        return 0
-
     try:
-        from pymilvus import Collection
-
-        col = Collection(settings.milvus_collection)
-
-        # 先 query 看有多少
-        rows = col.query(
-            expr=f'source == "{source}"',
-            output_fields=["pk"],
-            limit=16384,
-        )
-        if not rows:
-            return 0
-
-        # 用 pk 列表删除 (比 expr 删除更精确)
-        pks = [r["pk"] for r in rows]
-        col.delete(expr=f"pk in {pks}")
-        col.flush()
-
-        logger.info(f"[document] 删除 {source}: {len(pks)} 个 chunk")
-
-        # 同步刷新 BM25 索引 (避免删除后 BM25 仍能命中已删文档)
-        if settings.rag_hybrid_enabled and settings.rag_bm25_refresh_on_upload:
-            try:
-                from app.core.hybrid_retriever import refresh_bm25_index
-
-                refresh_bm25_index()
-            except Exception as e:
-                logger.warning(f"[document] BM25 刷新失败 (忽略): {type(e).__name__}: {e}")
-
-        return len(pks)
-
+        deleted = await pg_vector_store.delete_by_source(source)
     except Exception as e:
         logger.exception(f"[document] 删除失败: {e}")
         raise VectorStoreError(f"删除失败: {e}") from e
+
+    if deleted == 0:
+        return 0
+
+    logger.info(f"[document] 删除 {source}: {deleted} 个 chunk")
+
+    # BM25 走 ParadeDB pg_search, 索引随 DELETE 自动维护, 无需手动刷新。
+
+    return deleted
 
 
 # ============================================================

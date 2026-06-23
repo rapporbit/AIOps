@@ -28,16 +28,20 @@ Redis 故障时系统的核心决策是 **Fail-Open**：宁可临时多跑几个
 
 Postgres 是事实库，不是执行依赖。它挂了诊断能力不会完全丧失，但会丢失过程审计。`incident_pipeline_enabled=False` 可以彻底关闭事实库依赖，退化为纯同步诊断。
 
-## Milvus 故障
+## 向量库 / 词法检索故障 (pgvector + pg_search, 在 Postgres 内)
+
+向量库已从独立的 Milvus 迁到 Postgres 内的 **pgvector**（向量）+ **ParadeDB pg_search**（BM25），不再是独立服务。故障模式相应变化，且检索内部分层降级：
 
 | 场景 | 影响范围 | 系统表现 | 恢复方式 |
 |------|---------|---------|---------|
-| Milvus 不可用 | RAG 检索 | `search_knowledge_base` 工具返回空结果；Agent 退化为纯 LLM 推理（无知识库增强）；Readiness 返回 503 | Milvus 恢复后自动重连；BM25 内存索引需重建（首次检索时自动触发） |
-| Milvus 延迟高 | 检索性能 | 单次诊断总耗时增加；全局执行槽间接限制了并发检索压力 | 检查 Milvus 资源占用；HNSW `ef` 参数可调 |
+| Postgres 不可用 | RAG 检索 + 事故台账 | 向量/BM25 检索一并不可用（见「Postgres 故障」）；`search_knowledge_base` 退化为纯 LLM 推理；Readiness 返回 503 | Postgres 恢复后连接池自动重连 |
+| pg_search 缺失 / 未 preload | BM25 词法检索 | `bm25_search` 返回 `[]`，混合检索**自动降级为纯向量**；不报错、不阻断 | 用 `paradedb/paradedb` 镜像并把 `pg_search` 加入 `shared_preload_libraries` |
+| 向量检索失败（维度不符 / 索引缺失） | RAG 检索 | `safe_similarity_search` 返回 `[]`，`search_knowledge_base` 退化为纯 LLM 推理 | 检查 `kb_chunks` 维度 / HNSW 索引，必要时重建并重灌 |
+| 向量检索延迟高 | 检索性能 | 单次诊断总耗时增加；全局执行槽间接限制并发检索压力 | 查 Postgres 资源；`hnsw.ef_search` 可调 |
 
 ### 设计要点
 
-Milvus 是 Readiness 的必要依赖——没有知识库的 AIOps 诊断质量太差，不如不提供。但单次 Milvus 调用失败不会阻断诊断图，Agent 会尝试其他工具。
+向量/BM25 检索都在 Postgres 内，所以"向量库可用性"等同于"Postgres 可用性"——Postgres 是 Readiness 的必要依赖。但检索内部是分层降级的：BM25(pg_search) 失败 → 退回纯向量；向量失败 → 退回纯 LLM 推理。任一环节失败都不抛异常、不阻断诊断图。
 
 ## LLM API 故障
 
@@ -91,7 +95,7 @@ Reranker 是可选增强，不是必要依赖。降级策略：**永不抛异常
 | 场景 | 系统表现 | 最小可用能力 |
 |------|---------|------------|
 | Redis + Postgres 同时挂 | 只有同步 SSE 诊断可用，无审计、无队列 | 单人即时诊断（退化到基础版能力） |
-| LLM + Milvus 同时挂 | 诊断完全不可用 | 健康检查仍可响应，前端可展示历史任务 |
+| LLM + Postgres 同时挂 | 诊断完全不可用（向量/BM25 知识库随 Postgres 一并不可用） | 健康检查仍可响应，前端可展示历史任务 |
 | 单个 MCP + Reranker 同时挂 | 诊断可用但能力降级 | RAG 无精排 + 少部分工具缺失，报告会标注信息缺失 |
 
 ## 模拟面试问答
@@ -104,7 +108,7 @@ Reranker 是可选增强，不是必要依赖。降级策略：**永不抛异常
 
 **追问：如果让你给这个系统做一次混沌工程测试，你会怎么设计？**
 
-三个层次。一是组件故障注入：用 `docker pause` / `docker stop` 模拟 Redis、Postgres、Milvus、MCP Server 的单点故障和恢复，验证降级和自动恢复是否按预期工作。二是网络故障：用 `tc netem` 给 MCP Server 加延迟和丢包，看 Agent 的重试和超时处理。三是资源压力：限制 Worker 容器的 CPU 和内存，看 OOM 时任务是否正确进入 DLQ。每个测试场景需要预定义"通过标准"——比如 Redis 停 30 秒后恢复，队列中的任务应在 5 分钟内被正常消费，不丢失。
+三个层次。一是组件故障注入：用 `docker pause` / `docker stop` 模拟 Redis、Postgres（含向量/BM25 知识库）、MCP Server 的单点故障和恢复，验证降级和自动恢复是否按预期工作。二是网络故障：用 `tc netem` 给 MCP Server 加延迟和丢包，看 Agent 的重试和超时处理。三是资源压力：限制 Worker 容器的 CPU 和内存，看 OOM 时任务是否正确进入 DLQ。每个测试场景需要预定义"通过标准"——比如 Redis 停 30 秒后恢复，队列中的任务应在 5 分钟内被正常消费，不丢失。
 
 ---
 

@@ -8,7 +8,7 @@
   5. 注册全局异常处理器
   6. 注册路由
   7. 挂载静态文件 (前端)
-  8. lifespan 钩子 (启动时连 Milvus, 关闭时断开)
+  8. lifespan 钩子 (启动时连 Postgres + 初始化 pgvector, 关闭时断开)
 
 启动方式:
   开发: uvicorn app.main:app --reload
@@ -26,10 +26,12 @@ from fastapi.staticfiles import StaticFiles
 from loguru import logger
 
 from app.api.middleware import setup_middlewares
-from app.api.v1 import aiops, chat, documents, eval as eval_api, health, incidents, queue, skills, webhook, wiki, approvals
+from app.api.v1 import aiops, chat, documents, eval as eval_api, health, incidents, kb_sources, queue, skills, webhook, wiki, approvals
 from app.config import settings
+from app.core import pg_vector_store
+from app.core.kb_sync_schema import init_kb_sync_schema
 from app.core.mcp_client import mcp_client_manager
-from app.core.milvus import milvus_manager
+from app.services.kb_scheduler import start_scheduler, stop_scheduler
 from app.db.postgres import close_postgres, connect_postgres, init_incident_schema
 from app.exceptions import AppException
 from app.logging_config import setup_logging
@@ -56,27 +58,32 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # 1. 校验配置 (无效时直接抛错, 让 uvicorn 退出)
     settings.validate_runtime()
 
-    # 2. 连接 Milvus (必需依赖, 失败则启动失败)
-    milvus_manager.connect()
+    # 2. 连接 Postgres + 初始化向量库 (必需依赖: KB/RAG 现以 pgvector 落在 PG 内,
+    #    与 Incident Pipeline 是否开启无关, 失败则启动失败)
+    await connect_postgres()
+    await pg_vector_store.init_vector_schema()
+    await init_kb_sync_schema()
 
-    # 3. 初始化 Incident Pipeline (Postgres 事实库 + Redis Stream 队列)
+    # 3. 初始化 Incident Pipeline (事故台账 schema + Redis Stream 队列)
     if settings.incident_pipeline_enabled:
-        await connect_postgres()
         await init_incident_schema()
         await incident_queue.connect()
 
     # 4. 加载 MCP 工具 (可选依赖, 失败仅 warning)
     await mcp_client_manager.connect(fail_silently=True)
 
+    # 5. 启动知识库定时同步调度器 (KB_SYNC_ENABLED=false 则跳过)
+    start_scheduler()
+
     logger.info("应用就绪, 等待请求...")
     yield
     # ==================== 关闭 ====================
     logger.info("应用正在关闭...")
+    await stop_scheduler()
     await mcp_client_manager.close()
     if settings.incident_pipeline_enabled:
         await incident_queue.close()
-        await close_postgres()
-    milvus_manager.disconnect()
+    await close_postgres()
     logger.info("应用已关闭")
 
 
@@ -156,6 +163,7 @@ app.include_router(health.router, prefix=API_PREFIX)
 app.include_router(chat.router, prefix=API_PREFIX)
 app.include_router(aiops.router, prefix=API_PREFIX)
 app.include_router(documents.router, prefix=API_PREFIX)
+app.include_router(kb_sources.router, prefix=API_PREFIX)
 app.include_router(incidents.router, prefix=API_PREFIX)
 app.include_router(skills.router, prefix=API_PREFIX)
 app.include_router(webhook.router, prefix=API_PREFIX)

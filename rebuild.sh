@@ -4,8 +4,8 @@
 #
 #   ./rebuild.sh            # 重建 venv + 依赖, 重置并重导知识库, 然后启动
 #   ./rebuild.sh --wipe     # 额外: docker compose down -v 清空所有数据卷
-#                           #       (Postgres 事实库 / Milvus 向量库全部清掉)
-#   ./rebuild.sh --skip-kb  # 跳过知识库重导 (保留 Milvus 里已有的 collection)
+#                           #       (Postgres 事实库 + pgvector/pg_search 知识库一起清掉)
+#   ./rebuild.sh --skip-kb  # 跳过知识库重导 (保留 kb_chunks 里已有的向量/BM25)
 #
 # 适用场景: 首次部署 / .venv 损坏 / 依赖错乱 / 想把知识库重新灌一遍。
 # 日常只是开机启动请用 ./start.sh, 不需要重建。
@@ -64,7 +64,7 @@ echo "[rebuild] Docker daemon OK"
 
 # ---- 3) (可选) 清空数据卷 ----
 if [[ "$WIPE" == "1" ]]; then
-  echo "[rebuild] --wipe: docker compose down -v (清空 Postgres / Milvus 等所有数据卷)..."
+  echo "[rebuild] --wipe: docker compose down -v (清空 Postgres 等所有数据卷)..."
   docker compose down -v || true
 fi
 
@@ -76,20 +76,20 @@ PYBIN="$ROOT/.venv/bin/python"
 "$PYBIN" -m pip install --upgrade pip
 echo "[rebuild] 安装依赖 (requirements.txt)... 这一步较慢"
 "$PYBIN" -m pip install -r requirements.txt
-"$PYBIN" -c "import fastapi, pymilvus, langgraph, langchain, redis, asyncpg, ragas; print('[rebuild] 核心依赖导入 OK')"
+"$PYBIN" -c "import fastapi, langgraph, langchain, redis, asyncpg, ragas; print('[rebuild] 核心依赖导入 OK')"
 
 # ---- 5) 起基础设施 ----
 echo "[rebuild] 启动基础设施容器..."
-docker compose up -d redis postgres etcd minio standalone open-websearch
-echo "[rebuild] 等待 Redis / Milvus 就绪..."
+docker compose up -d redis postgres open-websearch
+echo "[rebuild] 等待 Redis / Postgres 就绪..."
 for _ in $(seq 1 40); do
   if docker compose exec -T redis redis-cli ping >/dev/null 2>&1; then break; fi
   sleep 1
 done
-# Milvus 起来要更久一点, 给它一些时间再导入
+# 等 Postgres (ParadeDB) 接受连接, ingest 要连它写 kb_chunks
 for _ in $(seq 1 40); do
-  if curl -sf --max-time 3 http://localhost:9091/healthz >/dev/null 2>&1; then break; fi
-  sleep 2
+  if docker compose exec -T postgres pg_isready >/dev/null 2>&1; then break; fi
+  sleep 1
 done
 
 # ---- 6) 重导知识库 ----

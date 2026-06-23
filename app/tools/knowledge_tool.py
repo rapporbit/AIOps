@@ -7,7 +7,7 @@ Agent 拿到这个工具, 可以查询运维知识库 (上传的 SOP 文档、On
   - 使用 @tool 装饰器, LangChain 会自动从函数签名 + docstring 生成 schema
   - 描述要写得清楚: LLM 决定何时调用工具完全靠 description
   - 返回字符串 (不是 dict), 因为 Agent 把工具返回值当 ToolMessage 内容
-  - 失败兜底: collection 不存在/Milvus 挂了 → 返回友好提示, 不抛异常
+  - 失败兜底: 表不存在/pgvector 挂了 → 返回友好提示, 不抛异常
 """
 
 from langchain_core.tools import tool

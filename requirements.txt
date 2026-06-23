@@ -26,14 +26,14 @@ langgraph>=1.0.0,<2.0.0
 langgraph-checkpoint>=3.0.0
 
 # ---------- 向量数据库 ----------
-pymilvus>=2.4.0
-langchain-milvus>=0.3.3,<0.4.0
+# 已从 Milvus 迁到 pgvector: 复用下方 asyncpg 连到的同一个 Postgres 实例,
+# 向量类型/HNSW 索引由服务端 pgvector 扩展提供 (镜像 pgvector/pgvector:pg16),
+# Python 侧无需额外包 (向量以 ::vector 文本字面量传参, 见 app/core/pg_vector_store.py)。
 
 # ---------- RAG Hybrid Search ----------
-# rank_bm25: 纯 Python BM25 实现 (~10KB), 用于 Hybrid Search 的 sparse 路.
-# 为什么不用 elasticsearch / opensearch: 项目规模 (千-万 chunks) 内存索引足够,
-# 不引入额外服务. 大规模时再迁外部 BM25 服务.
-rank_bm25>=0.2.2
+# BM25 (sparse 路) 已从进程内存 rank_bm25 迁到 DB 侧 ParadeDB pg_search:
+# 索引随写入自动维护, 无内存占用/截断, 多进程共享, 不再需要 Python BM25 包。
+# 见 app/core/pg_vector_store.py (bm25_search) 与 docker-compose postgres 服务。
 
 # ---------- MCP (Model Context Protocol) ----------
 fastmcp>=2.14.0

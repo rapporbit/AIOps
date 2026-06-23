@@ -66,31 +66,42 @@ def write_report(name: str, payload: dict[str, Any]) -> Path:
     return path
 
 
-def preflight_milvus() -> None:
-    from pymilvus import MilvusClient
+def preflight_vector_store() -> None:
+    """确认 pgvector 知识库就绪且非空, 否则 benchmark 会产生假未命中。"""
+    import asyncio
 
     from app.config import settings
+    from app.core import pg_vector_store
+    from app.db.postgres import close_postgres
 
-    uri = f"http://{settings.milvus_host}:{settings.milvus_port}"
+    async def _check() -> int:
+        try:
+            if not await pg_vector_store.is_ready():
+                return -1
+            return await pg_vector_store.count()
+        finally:
+            await close_postgres()
+
+    err: Exception | None = None
+    count = -1
     try:
-        parsed = urlparse(uri)
-        host = parsed.hostname or settings.milvus_host
-        port = parsed.port or settings.milvus_port
-        with socket.create_connection((host, port), timeout=2.0):
-            pass
-        client = MilvusClient(uri=uri)
-        if not client.has_collection(settings.milvus_collection):
-            raise RuntimeError(f"collection not found: {settings.milvus_collection}")
-    except Exception as exc:
+        count = asyncio.run(_check())
+    except Exception as exc:  # 连不上 / 表不存在等
+        err = exc
+
+    if err is not None or count <= 0:
+        detail = (
+            f"  error={type(err).__name__}: {err}\n"
+            if err is not None
+            else f"  table={settings.pgvector_table} count={count}\n"
+        )
         raise SystemExit(
-            "Milvus is not ready, benchmark would produce false misses.\n"
-            f"  uri={uri}\n"
-            f"  collection={settings.milvus_collection}\n"
-            f"  error={type(exc).__name__}: {exc}\n\n"
-            "Run:\n"
-            "  docker compose up -d\n"
-            "  python scripts/ingest_kb_corpus.py --reset --batch 8"
-        ) from exc
+            "向量库 (pgvector / kb_chunks) 未就绪或为空, benchmark 会产生假未命中。\n"
+            + detail
+            + "\nRun:\n"
+            "  docker compose up -d postgres\n"
+            "  python scripts/ingest_kb_corpus.py --reset"
+        )
 
 
 def mean(vals: list[float]) -> float:
@@ -151,7 +162,7 @@ async def run_retrieval(args: argparse.Namespace) -> dict[str, Any]:
     from app.config import settings
     from app.rag.retrieval import build_context
 
-    preflight_milvus()
+    preflight_vector_store()
     rows = load_jsonl(RETRIEVAL_QA, limit=args.limit, scenario=args.scenario, ids=args.ids)
     if not rows:
         raise SystemExit("No retrieval benchmark rows selected.")
@@ -463,7 +474,7 @@ async def run_openevals(
 async def run_ragas(args: argparse.Namespace) -> dict[str, Any]:
     from app.config import settings
 
-    preflight_milvus()
+    preflight_vector_store()
     rows = load_jsonl(RAGAS_QA, limit=args.limit, scenario=args.scenario, ids=args.ids)
     if not rows:
         raise SystemExit("No RAGAS benchmark rows selected.")

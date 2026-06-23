@@ -85,7 +85,7 @@
   <div class="card">
     <svg width="100%" viewBox="0 0 680 600" role="img" xmlns="http://www.w3.org/2000/svg">
       <title>Multi-Agent AIOps 平台七层架构</title>
-      <desc>从上到下七层:API 接入、队列缓冲、编排调度、智能体、RAG 知识、工具 MCP、存储审计;右侧为各层背靠的外部依赖如 Redis、LLM 云、Milvus、MCP 进程、PostgreSQL。</desc>
+      <desc>从上到下七层:API 接入、队列缓冲、编排调度、智能体、RAG 知识、工具 MCP、存储审计;右侧为各层背靠的外部依赖如 Redis、LLM 云、Embedding/Rerank 云、MCP 进程、PostgreSQL(含 pgvector 知识库)。</desc>
       <defs>
         <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
           <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
@@ -112,7 +112,7 @@
       <line x1="250" y1="354" x2="250" y2="366" class="arr" marker-end="url(#arrow)"/>
       <g class="node c-teal"><rect x="50" y="368" width="400" height="56" rx="8" stroke-width="0.5"/>
         <text class="th" x="250" y="388" text-anchor="middle" dominant-baseline="central">L5 · RAG 知识层</text>
-        <text class="ts" x="250" y="406" text-anchor="middle" dominant-baseline="central">Milvus 向量 + BM25 + RRF + Rerank</text></g>
+        <text class="ts" x="250" y="406" text-anchor="middle" dominant-baseline="central">pgvector 向量 + pg_search BM25 + RRF + Rerank</text></g>
       <line x1="250" y1="426" x2="250" y2="438" class="arr" marker-end="url(#arrow)"/>
       <g class="node c-teal"><rect x="50" y="440" width="400" height="56" rx="8" stroke-width="0.5"/>
         <text class="th" x="250" y="460" text-anchor="middle" dominant-baseline="central">L6 · 工具与 MCP 层</text>
@@ -132,8 +132,8 @@
         <text class="ts" x="559" y="333" text-anchor="middle" dominant-baseline="central">DeepSeek · DashScope</text></g>
       <line x1="452" y1="396" x2="474" y2="396" class="arr" marker-end="url(#arrow)"/>
       <g class="c-coral"><rect x="478" y="374" width="162" height="44" rx="8" stroke-width="0.5"/>
-        <text class="th" x="559" y="388" text-anchor="middle" dominant-baseline="central">Milvus + Embed</text>
-        <text class="ts" x="559" y="405" text-anchor="middle" dominant-baseline="central">bge-m3 · Rerank</text></g>
+        <text class="th" x="559" y="388" text-anchor="middle" dominant-baseline="central">Embedding/Rerank 云</text>
+        <text class="ts" x="559" y="405" text-anchor="middle" dominant-baseline="central">bge-m3 · gte-rerank</text></g>
       <line x1="452" y1="468" x2="474" y2="468" class="arr" marker-end="url(#arrow)"/>
       <g class="c-coral"><rect x="478" y="446" width="162" height="44" rx="8" stroke-width="0.5"/>
         <text class="th" x="559" y="460" text-anchor="middle" dominant-baseline="central">MCP 工具进程</text>
@@ -210,10 +210,10 @@
 
   <h2>三、关键说明</h2>
   <ul>
-    <li><strong>外部依赖</strong>:Redis(队列 + 执行槽)、LLM 云(DeepSeek / DashScope)、Milvus + Embedding/Rerank(bge-m3)、5 个 MCP 工具进程(系统 / 网络 / Docker / WebSearch / WinLog)、PostgreSQL 事实库。</li>
+    <li><strong>外部依赖</strong>:Redis(队列 + 执行槽)、LLM 云(DeepSeek / DashScope)、Embedding/Rerank 云(bge-m3 · gte-rerank-v2)、5 个 MCP 工具进程(系统 / 网络 / Docker / WebSearch / WinLog)、PostgreSQL(事实库 + pgvector/pg_search 知识库)。</li>
     <li><strong>并发控制</strong>:分布式执行槽用 Redis ZSET + Lua 实现,解决 <code>asyncio.Semaphore</code> 在多进程下失效的问题。</li>
     <li><strong>双模式</strong>:<code>fast</code> 走 Skill Router→Planner→Executor→Replanner→Report 快速闭环;<code>deep</code> 走多 Agent 并行取证→Evidence Reducer→RCA Judge 深度根因。</li>
-    <li><strong>检索</strong>:Parent-Child 分块 + Vector(Milvus)+ BM25 双路召回 + RRF 融合 + Rerank 精排。</li>
+    <li><strong>检索</strong>:Parent-Child 分块 + Vector(pgvector)+ BM25(ParadeDB pg_search)双路召回 + RRF 融合 + Rerank 精排。</li>
     <li><strong>审计</strong>:全链路可追溯 <code>task → agent_run → tool_call → evidence</code>,经验沉淀进 Wiki 供下次路由复用。</li>
   </ul>
 
@@ -221,7 +221,7 @@
   <ul>
     <li>主服务:<code>uvicorn app.main:app</code> — FastAPI + SSE</li>
     <li>后台 Worker:<code>python -m app.diagnosis_worker</code> — 消费 Redis 队列</li>
-    <li>基础设施:<code>docker-compose.yml</code>(Milvus + Redis + Postgres + Attu)</li>
+    <li>基础设施:<code>docker-compose.yml</code>(ParadeDB/Postgres + Redis)</li>
     <li>详细文档:<code>docs/architecture.md</code> 与 <code>docs/layers/</code></li>
   </ul>
 </div>
